@@ -132,7 +132,7 @@
       $('#orc', s).onclick = () => { const q = queue(); const x = q.find(y => y.id === id); matchLog(x); saveQ(q); s.remove(); outcomeSheet(id); };
       $('#os', s).onclick = () => {
         if (!pick) { $('#oe', s).textContent = 'Choose the result of the call'; return; }
-        let cb = null; if (pick === 'callback') { const v = $('#cbt', s).value; if (!v) { $('#oe', s).textContent = 'Choose the callback date and time'; return; } cb = new Date(v).getTime(); }
+        let cb = null; if (pick === 'callback') { const v = $('#cbt', s).value; if (!v) { $('#oe', s).textContent = 'Choose the callback date and time'; return; } cb = Date.parse(v + ':00+05:30'); }
         const q = queue(); const x = q.find(y => y.id === id); if (!x.log_found) matchLog(x);
         Object.assign(x, { outcome: pick, callback_at: cb, note: $('#nt', s).value.trim().slice(0, 500), ready: true, synced: false, ver: (x.ver || 1) + 1 }); saveQ(q); LS.del('active');
         const L = LS.get('list', []); const c = L.find(y => y.id === x.contact_id); if (c) { c.status = pick; c.last_call_at = x.start_ts || x.tapped_at; c.callback_at = cb; if (x.note) c.last_note = x.note; LS.set('list', L); }
@@ -162,7 +162,7 @@
         $('#ms').outerHTML = `<div class="stats"><div class="stat"><b>${a.made}</b><span>Calls today</span></div><div class="stat"><b>${a.counted}</b><span>Counted today</span></div><div class="stat"><b>${a.leads}</b><span>Interested leads</span></div><div class="stat"><b>${rs(a.payout)}</b><span>Earned today</span></div></div>
           <div class="card" style="margin-top:12px"><h2>This month</h2><div class="small">Calls ${m.made} · Connected ${m.connected} · Counted ${m.counted} · Leads ${m.leads}</div><div style="font-size:20px;font-weight:700;margin-top:4px">${rs(m.payout)}</div>
           <div class="mut small">${rs(j.settings.call_rate)} per counted call (min ${j.settings.min_duration}s) + ${rs(j.settings.lead_rate)} per interested lead${m.adjust ? ` · adjustments ${rs(m.adjust)}` : ''}</div></div>${local}
-          <div class="card"><h2>Recent calls</h2><div class="tw"><table><tr><th>Time</th><th>Client</th><th class="n">Talk</th><th>Result</th><th>Counted?</th></tr>${j.recent.map(c => `<tr><td>${fmtT(c.start_ts || c.tapped_at)}</td><td>${esc(c.contact_name || c.phone)}</td><td class="n">${fmtD(c.duration)}</td><td>${esc(c.outcome_label)}</td><td>${c.counted ? '<span class="tag ok">Counted</span>' : `<span class="tag bad">No</span> <span class="small mut">${esc(c.reason_text)}</span>`}${c.lead_counted ? ' <span class="tag ok">Lead</span>' : ''}</td></tr>`).join('') || '<tr><td colspan="5" class="mut">No calls yet</td></tr>'}</table></div></div>`;
+          <div class="card clist"><h2>Recent calls</h2>${j.recent.map(c => `<div class="ci" style="display:block"><div class="row"><b class="grow">${esc(c.contact_name || c.phone)}</b><span class="small mut">${fmtT(c.start_ts || c.tapped_at)}</span></div><div class="small">${c.log_found ? 'Talk ' + fmtD(c.duration) : 'Not in call log'} · ${esc(c.outcome_label || 'No result')}</div><div class="small" style="margin-top:3px">${c.counted ? '<span class="tag ok">Counted</span>' : `<span class="tag bad">Not counted</span> <span class="mut">${esc(c.reason_text)}</span>`}${c.lead_counted ? ' <span class="tag ok">Lead</span>' : ''}</div></div>`).join('') || '<p class="mut">No calls yet</p>'}</div>`;
       } catch (e) { $('#ms').textContent = e.offline ? 'Offline — connect to the internet to see your totals.' : e.message; }
     } else {
       main.innerHTML = warn + `<div class="card"><h2>How your calls are counted</h2><ul class="small">
@@ -200,14 +200,15 @@
     try { await (ADMIN[t] || ADMIN.dash)(main); } catch (e) { main.innerHTML = `<div class="card err">${esc(e.message)}</div>`; }
   }
   function exportX(name, sheets) { // sheets: [{name, rows: [[...]]}]
-    const wb = XLSX.utils.book_new(); for (const s of sheets) XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(s.rows), s.name.slice(0, 31));
+    const wb = XLSX.utils.book_new(); const num = v => (typeof v === 'string' && /^₹-?[\d,]+(\.\d+)?$/.test(v)) ? Number(v.slice(1).replace(/,/g, '')) : v;
+    for (const s of sheets) XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(s.rows.map((r, i) => i === 0 ? r.map(h => /pay|Adjust|Payout/i.test(h) && !/Interested/.test(h) ? h + ' (₹)' : h) : r.map(num))), s.name.slice(0, 31));
     if (NATIVE && NATIVE.saveFile) { NATIVE.saveFile(XLSX.write(wb, { type: 'base64', bookType: 'xlsx' }), name + '.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'); return; }
     XLSX.writeFile(wb, name + '.xlsx');
   }
   function exportP(name, title, sub, head, body) {
     const { jsPDF } = window.jspdf; const doc = new jsPDF({ orientation: head.length > 7 ? 'landscape' : 'portrait', unit: 'pt', format: 'a4' });
-    doc.setFontSize(15); doc.text(title, 40, 42); doc.setFontSize(9); doc.setTextColor(90); doc.text(sub, 40, 58);
     const fix = v => String(v == null ? '' : v).replace(/₹/g, 'Rs ');
+    doc.setFontSize(15); doc.text(fix(title), 40, 42); doc.setFontSize(9); doc.setTextColor(90); doc.text(fix(sub), 40, 58);
     doc.autoTable({ startY: 70, head: [head.map(fix)], body: body.map(r => r.map(fix)), styles: { fontSize: 8.5, cellPadding: 4 }, headStyles: { fillColor: [11, 37, 69] }, margin: { left: 40, right: 40 } });
     doc.setFontSize(8); doc.text('R&S Calling · generated ' + new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }), 40, doc.internal.pageSize.getHeight() - 20);
     if (NATIVE && NATIVE.saveFile) { NATIVE.saveFile(doc.output('datauristring').split(',')[1], name + '.pdf', 'application/pdf'); return; }
