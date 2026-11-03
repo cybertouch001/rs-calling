@@ -1,0 +1,437 @@
+// R&S Calling — hosted API (Cloudflare Worker + D1). Static files (landing page, web app, APK) come from ASSETS.
+import * as R from './rules.js';
+import { VERSION, ADMIN_BOOT, APK } from './config.js';
+
+const SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, role TEXT NOT NULL, username TEXT NOT NULL UNIQUE COLLATE NOCASE, phone TEXT, name TEXT, pw TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at INTEGER, updated_at INTEGER)`,
+  `CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, user_id TEXT NOT NULL, app TEXT, device TEXT, ip TEXT, created_at INTEGER, last_seen INTEGER, revoked_at INTEGER, revoke_reason TEXT)`,
+  `CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id)`,
+  `CREATE TABLE IF NOT EXISTS contacts (id TEXT PRIMARY KEY, phone TEXT NOT NULL UNIQUE, name TEXT, area TEXT, notes TEXT, assigned_to TEXT, assigned_at INTEGER, status TEXT DEFAULT 'new', last_call_at INTEGER, last_note TEXT, callback_at INTEGER, lead_state TEXT, followup_at INTEGER, followup_note TEXT, batch TEXT, created_at INTEGER)`,
+  `CREATE INDEX IF NOT EXISTS contacts_assigned ON contacts(assigned_to)`,
+  `CREATE TABLE IF NOT EXISTS calls (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, contact_id TEXT, phone TEXT, log_phone TEXT, tapped_at INTEGER, start_ts INTEGER, duration INTEGER DEFAULT 0, log_found INTEGER DEFAULT 0, log_type TEXT, assigned_ok INTEGER DEFAULT 0, outcome TEXT, callback_at INTEGER, note TEXT, device TEXT, synced_at INTEGER, elig_reason TEXT, counted INTEGER DEFAULT 0, reason TEXT, lead_counted INTEGER DEFAULT 0, lead_reason TEXT, override INTEGER, override_reason TEXT, lead_override INTEGER, lead_override_reason TEXT, call_rate REAL, lead_rate REAL, approval_id TEXT)`,
+  `CREATE INDEX IF NOT EXISTS calls_user_t ON calls(user_id, start_ts)`,
+  `CREATE INDEX IF NOT EXISTS calls_phone ON calls(phone)`,
+  `CREATE INDEX IF NOT EXISTS calls_t ON calls(tapped_at)`,
+  `CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)`,
+  `CREATE TABLE IF NOT EXISTS adjustments (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, day TEXT NOT NULL, amount REAL NOT NULL, reason TEXT NOT NULL, created_by TEXT, created_at INTEGER, approval_id TEXT)`,
+  `CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, from_day TEXT, to_day TEXT, made INTEGER, counted INTEGER, leads INTEGER, call_amount REAL, lead_amount REAL, adjust REAL, payout REAL, note TEXT, approved_by TEXT, approved_at INTEGER, paid INTEGER DEFAULT 0)`,
+  `CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, user_id TEXT, action TEXT, detail TEXT)`,
+  `CREATE TABLE IF NOT EXISTS login_fail (k TEXT PRIMARY KEY, n INTEGER, first_at INTEGER)`,
+];
+
+let ready = null;
+async function init(db) {
+  if (!ready) ready = (async () => {
+    await db.batch(SCHEMA.map(q => db.prepare(q)));
+    if (ADMIN_BOOT && ADMIN_BOOT.username) {
+      const has = await db.prepare(`SELECT id FROM users WHERE role='admin' LIMIT 1`).first();
+      if (!has) await db.prepare(`INSERT INTO users (id, role, username, name, pw, active, created_at) VALUES (?, 'admin', ?, 'Admin', ?, 1, ?)`)
+        .bind(uid(), ADMIN_BOOT.username, ADMIN_BOOT.pw, Date.now()).run();
+    }
+  })().catch(e => { ready = null; throw e; });
+  return ready;
+}
+
+// ---------- helpers ----------
+const enc = new TextEncoder();
+const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
+function uid(n = 12) { const a = new Uint8Array(n); crypto.getRandomValues(a); return hex(a); }
+async function sha256(s) { return hex(await crypto.subtle.digest('SHA-256', enc.encode(s))); }
+async function pbkdf2(pw, saltHex, iter) {
+  const key = await crypto.subtle.importKey('raw', enc.encode(pw), 'PBKDF2', false, ['deriveBits']);
+  const salt = new Uint8Array(saltHex.match(/../g).map(h => parseInt(h, 16)));
+  return hex(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: iter }, key, 256));
+}
+export async function hashPw(pw) { const salt = uid(16); return `pbkdf2-sha256$100000$${salt}$${await pbkdf2(pw, salt, 100000)}`; }
+async function checkPw(pw, stored) {
+  const [alg, it, salt, h] = String(stored || '').split('$'); if (alg !== 'pbkdf2-sha256') return false;
+  const got = await pbkdf2(String(pw), salt, Number(it)); let d = 0; for (let i = 0; i < h.length; i++) d |= h.charCodeAt(i) ^ got.charCodeAt(i);
+  return d === 0 && got.length === h.length;
+}
+class ApiError extends Error { constructor(status, msg, extra) { super(msg); this.status = status; this.extra = extra; } }
+const bad = (m) => { throw new ApiError(400, m); };
+const json = (o, status = 200, h = {}) => new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...h } });
+const str = (v, max = 200) => String(v == null ? '' : v).trim().slice(0, max);
+const int = (v, d = null) => (v === null || v === undefined || v === '' || !isFinite(Number(v))) ? d : Math.round(Number(v));
+async function audit(db, u, action, detail) {
+  await db.prepare(`INSERT INTO audit (at, user_id, action, detail) VALUES (?,?,?,?)`).bind(Date.now(), u ? u.id : null, action, typeof detail === 'string' ? detail : JSON.stringify(detail)).run();
+}
+async function getSettings(db) {
+  const rows = (await db.prepare(`SELECT k, v FROM settings`).all()).results; const s = { ...R.DEFAULTS };
+  for (const r of rows) if (r.k in s) s[r.k] = Number(r.v);
+  return s;
+}
+async function chunked(arr, n, fn) { const out = []; for (let i = 0; i < arr.length; i += n) out.push(...(await fn(arr.slice(i, i + n)) || [])); return out; }
+
+// ---------- auth ----------
+async function authUser(db, req) {
+  const m = /^Bearer\s+([0-9a-f]{64})$/i.exec(req.headers.get('authorization') || ''); if (!m) throw new ApiError(401, 'Please log in');
+  const th = await sha256(m[1]);
+  const s = await db.prepare(`SELECT s.id sid, s.revoked_at, s.revoke_reason, s.last_seen, u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?`).bind(th).first();
+  if (!s) throw new ApiError(401, 'Session expired, please log in again');
+  if (s.revoked_at) throw new ApiError(401, s.revoke_reason || 'You were logged out', { logged_out: true });
+  if (!s.active) throw new ApiError(401, 'Your account is deactivated', { logged_out: true });
+  const now = Date.now(); if (now - (s.last_seen || 0) > 60000) await db.prepare(`UPDATE sessions SET last_seen=? WHERE id=?`).bind(now, s.sid).run();
+  return { id: s.id, role: s.role, username: s.username, name: s.name, phone: s.phone, sid: s.sid };
+}
+async function revokeUser(db, userId, reason, exceptSid = null) {
+  await db.prepare(`UPDATE sessions SET revoked_at=?, revoke_reason=? WHERE user_id=? AND revoked_at IS NULL AND id IS NOT ?`).bind(Date.now(), reason, userId, exceptSid).run();
+}
+
+async function login(db, b, req) {
+  const login = str(b.login, 80), pw = String(b.password || ''); if (!login || !pw) bad('Enter username/phone and password');
+  const k = 'l:' + login.toLowerCase(); const now = Date.now();
+  const f = await db.prepare(`SELECT n, first_at FROM login_fail WHERE k=?`).bind(k).first();
+  if (f && f.n >= 8 && now - f.first_at < 15 * 60000) throw new ApiError(429, 'Too many wrong attempts. Try again in 15 minutes.');
+  const phone = R.normPhone(login);
+  const u = await db.prepare(`SELECT * FROM users WHERE username = ? COLLATE NOCASE OR (phone != '' AND phone = ?) LIMIT 1`).bind(login, phone || '#').first();
+  if (!u || !(await checkPw(pw, u.pw))) {
+    if (!f || now - f.first_at >= 15 * 60000) await db.prepare(`INSERT OR REPLACE INTO login_fail (k, n, first_at) VALUES (?, 1, ?)`).bind(k, now).run();
+    else await db.prepare(`UPDATE login_fail SET n = n + 1 WHERE k=?`).bind(k).run();
+    throw new ApiError(401, 'Wrong username/phone or password');
+  }
+  if (!u.active) throw new ApiError(403, 'Your account is deactivated. Contact the admin.');
+  await db.prepare(`DELETE FROM login_fail WHERE k=?`).bind(k).run();
+  const token = uid(32); const sid = uid(8);
+  await db.prepare(`INSERT INTO sessions (id, token_hash, user_id, app, device, ip, created_at, last_seen) VALUES (?,?,?,?,?,?,?,?)`)
+    .bind(sid, await sha256(token), u.id, str(b.app, 20) || 'web', str(b.device, 120) || (req.headers.get('user-agent') || '').slice(0, 120), req.headers.get('cf-connecting-ip') || '', now, now).run();
+  await audit(db, u, 'login', { app: str(b.app, 20) || 'web' });
+  return { token, user: { id: u.id, role: u.role, username: u.username, name: u.name, phone: u.phone } };
+}
+
+// ---------- counting ----------
+const CALL_COLS = `id, user_id, contact_id, phone, log_phone, tapped_at, start_ts, duration, log_found, assigned_ok, outcome, elig_reason, counted, reason, lead_counted, lead_reason, override, lead_override, approval_id`;
+async function recomputeFor(db, synced, s) {
+  if (!synced.length) return;
+  const updates = []; const phones = new Set(synced.map(c => c.phone).filter(Boolean));
+  // stage 1+2: eligibility for each affected caller around the synced calls (same-time calls need neighbours)
+  const byUser = new Map(); for (const c of synced) { const t = c.start_ts || c.tapped_at || Date.now(); const w = byUser.get(c.user_id) || [Infinity, -Infinity]; byUser.set(c.user_id, [Math.min(w[0], t), Math.max(w[1], t)]); }
+  for (const [userId, [a, b]] of byUser) {
+    const rows = (await db.prepare(`SELECT ${CALL_COLS} FROM calls WHERE user_id=? AND COALESCE(start_ts, tapped_at) BETWEEN ? AND ?`).bind(userId, a - 6 * 3600000, b + 6 * 3600000).all()).results;
+    const ov = R.overlapIds(rows);
+    for (const c of rows) {
+      if (c.approval_id) continue;
+      const er = R.baseReason(c, s) || (ov.has(c.id) ? 'overlap' : null);
+      if (er !== c.elig_reason) { updates.push(db.prepare(`UPDATE calls SET elig_reason=? WHERE id=?`).bind(er, c.id)); phones.add(c.phone); }
+    }
+  }
+  if (updates.length) await chunked(updates, 80, x => db.batch(x).then(() => []));
+  await rechainPhones(db, [...phones], s);
+}
+async function rechainPhones(db, phones, s) {
+  const updates = [];
+  await chunked(phones.filter(Boolean), 40, async ps => {
+    const rows = (await db.prepare(`SELECT ${CALL_COLS} FROM calls WHERE phone IN (${ps.map(() => '?').join(',')})`).bind(...ps).all()).results;
+    const byP = new Map(); for (const c of rows) (byP.get(c.phone) || byP.set(c.phone, []).get(c.phone)).push(c);
+    for (const list of byP.values()) {
+      const input = list.map(c => c.approval_id ? { ...c, override: c.counted ? 1 : 0, lead_override: c.lead_counted ? c.lead_override : 0 } : c);
+      const res = R.chainNumber(input, s);
+      for (const c of list) {
+        if (c.approval_id) continue; const r = res.get(c.id);
+        if ((r.counted ? 1 : 0) !== c.counted || r.reason !== c.reason || (r.lead_counted ? 1 : 0) !== c.lead_counted || r.lead_reason !== c.lead_reason)
+          updates.push(db.prepare(`UPDATE calls SET counted=?, reason=?, lead_counted=?, lead_reason=? WHERE id=?`).bind(r.counted ? 1 : 0, r.reason, r.lead_counted ? 1 : 0, r.lead_reason, c.id));
+      }
+    }
+  });
+  if (updates.length) await chunked(updates, 80, x => db.batch(x).then(() => []));
+}
+async function recalcAll(db) {
+  const s = await getSettings(db);
+  const rows = (await db.prepare(`SELECT ${CALL_COLS} FROM calls`).all()).results;
+  const updates = [];
+  const byUser = new Map(); for (const c of rows) (byUser.get(c.user_id) || byUser.set(c.user_id, []).get(c.user_id)).push(c);
+  for (const list of byUser.values()) { const ov = R.overlapIds(list); for (const c of list) { if (c.approval_id) continue; const er = R.baseReason(c, s) || (ov.has(c.id) ? 'overlap' : null); if (er !== c.elig_reason) { c.elig_reason = er; updates.push(db.prepare(`UPDATE calls SET elig_reason=? WHERE id=?`).bind(er, c.id)); } } }
+  if (updates.length) await chunked(updates, 80, x => db.batch(x).then(() => []));
+  await rechainPhones(db, [...new Set(rows.map(c => c.phone))], s);
+  return rows.length;
+}
+
+// ---------- reads ----------
+function rangeFrom(b, s) {
+  const today = R.dayKey(Date.now(), s.tz_offset_min);
+  const from = /^\d{4}-\d{2}-\d{2}$/.test(b.from || '') ? b.from : today; const to = /^\d{4}-\d{2}-\d{2}$/.test(b.to || '') ? b.to : from;
+  return { from, to, a: R.dayStart(from, s.tz_offset_min), z: R.dayStart(to, s.tz_offset_min) + 86400000 };
+}
+async function callsIn(db, a, z, userId) {
+  const q = `SELECT c.*, k.name contact_name, k.area contact_area FROM calls c LEFT JOIN contacts k ON k.id = c.contact_id WHERE COALESCE(c.start_ts, c.tapped_at) >= ? AND COALESCE(c.start_ts, c.tapped_at) < ?` + (userId ? ` AND c.user_id = ?` : '') + ` ORDER BY COALESCE(c.start_ts, c.tapped_at) DESC`;
+  const st = db.prepare(q); return (await (userId ? st.bind(a, z, userId) : st.bind(a, z)).all()).results;
+}
+async function adjIn(db, from, to, userId) {
+  const q = `SELECT * FROM adjustments WHERE day >= ? AND day <= ?` + (userId ? ` AND user_id=?` : '') + ` ORDER BY day`;
+  const st = db.prepare(q); return (await (userId ? st.bind(from, to, userId) : st.bind(from, to)).all()).results;
+}
+function decorate(c) { return { ...c, reason_text: R.REASON_TEXT[c.reason] || c.reason || '', outcome_label: R.OUTCOME_LABEL[c.outcome] || '' }; }
+async function perCaller(db, s, from, to, onlyUser) {
+  const a = R.dayStart(from, s.tz_offset_min), z = R.dayStart(to, s.tz_offset_min) + 86400000;
+  const users = (await db.prepare(`SELECT id, name, username, phone, active FROM users WHERE role='caller' ORDER BY name`).all()).results.filter(u => !onlyUser || u.id === onlyUser);
+  const calls = await callsIn(db, a, z, onlyUser); const adj = await adjIn(db, from, to, onlyUser);
+  return users.filter(u => u.active || calls.some(c => c.user_id === u.id) || adj.some(x => x.user_id === u.id)).map(u => {
+    const mine = calls.filter(c => c.user_id === u.id); const t = R.totals(mine, adj.filter(x => x.user_id === u.id));
+    const days = {}; for (const c of mine) (days[R.dayKey(c.start_ts || c.tapped_at, s.tz_offset_min)] ||= []).push(c);
+    const flags = []; for (const [d, list] of Object.entries(days)) for (const f of R.dayFlags(list, s)) flags.push(`${d}: ${f}`);
+    return { user: u, ...t, flags };
+  });
+}
+
+// ---------- API methods ----------
+const M = {};
+M.me = async (db, u) => ({ user: u, settings: await getSettings(db), version: VERSION });
+M.logout = async (db, u) => { await db.prepare(`UPDATE sessions SET revoked_at=?, revoke_reason='Logged out' WHERE id=?`).bind(Date.now(), u.sid).run(); return {}; };
+M.change_password = async (db, u, b) => {
+  const row = await db.prepare(`SELECT pw FROM users WHERE id=?`).bind(u.id).first();
+  if (!(await checkPw(String(b.old || ''), row.pw))) bad('Current password is wrong');
+  if (String(b.new || '').length < 8) bad('New password must be at least 8 characters');
+  await db.prepare(`UPDATE users SET pw=?, updated_at=? WHERE id=?`).bind(await hashPw(String(b.new)), Date.now(), u.id).run();
+  await revokeUser(db, u.id, 'Password changed — please log in again', u.sid); await audit(db, u, 'change_password', ''); return {};
+};
+
+// caller
+M.my_list = async (db, u) => {
+  const s = await getSettings(db);
+  const rows = (await db.prepare(`SELECT id, phone, name, area, notes, status, last_call_at, last_note, callback_at FROM contacts WHERE assigned_to=? ORDER BY CASE WHEN status='callback' THEN 0 WHEN status='new' THEN 1 ELSE 2 END, COALESCE(callback_at, 0), name LIMIT 5000`).bind(u.id).all()).results;
+  return { contacts: rows, settings: { min_duration: s.min_duration, repeat_hours: s.repeat_hours, call_rate: s.call_rate, lead_rate: s.lead_rate, tz_offset_min: s.tz_offset_min } };
+};
+M.sync = async (db, u, b) => {
+  if (u.role !== 'caller') bad('Only caller accounts sync calls');
+  const s = await getSettings(db); const list = Array.isArray(b.calls) ? b.calls.slice(0, 300) : []; const now = Date.now();
+  const done = []; const synced = []; const stmts = [];
+  for (const x of list) {
+    const id = str(x.id, 40); if (!/^[A-Za-z0-9_-]{8,40}$/.test(id)) continue;
+    const ex = await db.prepare(`SELECT id, user_id, approval_id, phone FROM calls WHERE id=?`).bind(id).first();
+    if (ex && ex.user_id !== u.id) continue;
+    const outcome = R.OUTCOMES.includes(x.outcome) ? x.outcome : null; const cb = outcome === 'callback' ? int(x.callback_at) : null; const note = str(x.note, 500);
+    if (ex) {           // already have the call — only the outcome / note can change after the fact
+      if (!ex.approval_id) stmts.push(db.prepare(`UPDATE calls SET outcome=COALESCE(?, outcome), callback_at=COALESCE(?, callback_at), note=CASE WHEN ?='' THEN note ELSE ? END, log_found=MAX(log_found, ?), start_ts=COALESCE(start_ts, ?), duration=MAX(duration, ?), log_phone=COALESCE(log_phone, ?) WHERE id=?`)
+        .bind(outcome, cb, note, note, x.log_found ? 1 : 0, int(x.start_ts), Math.max(0, int(x.duration, 0)), str(x.log_phone, 20) || null, id));
+    } else {
+      const contact = x.contact_id ? await db.prepare(`SELECT id, phone, assigned_to FROM contacts WHERE id=?`).bind(str(x.contact_id, 40)).first() : null;
+      const phone = contact ? contact.phone : R.normPhone(x.phone);
+      const assigned = contact && contact.assigned_to === u.id ? 1 : 0;
+      stmts.push(db.prepare(`INSERT INTO calls (id, user_id, contact_id, phone, log_phone, tapped_at, start_ts, duration, log_found, log_type, assigned_ok, outcome, callback_at, note, device, synced_at, call_rate, lead_rate) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .bind(id, u.id, contact ? contact.id : null, phone, R.normPhone(x.log_phone) || null, int(x.tapped_at), int(x.start_ts), Math.max(0, int(x.duration, 0)), x.log_found ? 1 : 0, str(x.log_type, 20) || null, assigned, outcome, cb, note, str(x.device, 120), now, s.call_rate, s.lead_rate));
+    }
+    if (outcome && x.contact_id) stmts.push(db.prepare(`UPDATE contacts SET status=?, last_call_at=?, last_note=CASE WHEN ?='' THEN last_note ELSE ? END, callback_at=?, lead_state=CASE WHEN ?='interested' AND lead_state IS NULL THEN 'open' ELSE lead_state END WHERE id=? AND assigned_to=?`)
+      .bind(outcome, int(x.start_ts) || int(x.tapped_at) || now, note, note, cb, outcome, str(x.contact_id, 40), u.id));
+    synced.push({ id, user_id: u.id, phone: ex ? ex.phone : null, start_ts: int(x.start_ts), tapped_at: int(x.tapped_at) }); done.push(id);
+  }
+  if (stmts.length) await chunked(stmts, 60, z => db.batch(z).then(() => []));
+  if (synced.length) {
+    const rows = await chunked(done, 50, ids => db.prepare(`SELECT id, user_id, phone, start_ts, tapped_at FROM calls WHERE id IN (${ids.map(() => '?').join(',')})`).bind(...ids).all().then(r => r.results));
+    await recomputeFor(db, rows, s);
+  }
+  const res = done.length ? await chunked(done, 50, ids => db.prepare(`SELECT id, counted, reason, lead_counted, lead_reason FROM calls WHERE id IN (${ids.map(() => '?').join(',')})`).bind(...ids).all().then(r => r.results)) : [];
+  return { synced: done, results: res.map(decorate) };
+};
+M.my_stats = async (db, u, b) => {
+  const s = await getSettings(db); const today = R.dayKey(Date.now(), s.tz_offset_min); const month = today.slice(0, 8) + '01';
+  const [t] = await perCaller(db, s, today, today, u.id); const [m] = await perCaller(db, s, month, today, u.id);
+  const a = R.dayStart(today, s.tz_offset_min) - 6 * 86400000; const recent = (await callsIn(db, a, Date.now() + 86400000, u.id)).slice(0, 100).map(decorate);
+  return { today: t, month: m, recent, settings: { min_duration: s.min_duration, call_rate: s.call_rate, lead_rate: s.lead_rate, repeat_hours: s.repeat_hours } };
+};
+
+// admin
+const A = {};
+A.settings_get = async (db) => ({ settings: await getSettings(db) });
+A.settings_save = async (db, u, b) => {
+  const old = await getSettings(db); const nw = { ...old };
+  const lim = { call_rate: [0, 10000], lead_rate: [0, 100000], min_duration: [0, 3600], repeat_hours: [0, 24 * 30] };
+  for (const k of Object.keys(lim)) if (b[k] !== undefined && b[k] !== '') { const v = Number(b[k]); if (!isFinite(v) || v < lim[k][0] || v > lim[k][1]) bad(`Invalid value for ${k}`); nw[k] = k.endsWith('rate') ? Math.round(v * 100) / 100 : Math.round(v); }
+  await db.batch(Object.keys(lim).map(k => db.prepare(`INSERT OR REPLACE INTO settings (k, v) VALUES (?, ?)`).bind(k, String(nw[k]))));
+  let rated = 0;
+  if (b.apply_rates_to_unapproved && (nw.call_rate !== old.call_rate || nw.lead_rate !== old.lead_rate || b.force_rates)) {
+    const r = await db.prepare(`UPDATE calls SET call_rate=?, lead_rate=? WHERE approval_id IS NULL`).bind(nw.call_rate, nw.lead_rate).run(); rated = r.meta && r.meta.changes || 0;
+  }
+  let recalculated = 0; if (nw.min_duration !== old.min_duration || nw.repeat_hours !== old.repeat_hours) recalculated = await recalcAll(db);
+  await audit(db, u, 'settings_save', { old, new: nw, apply_rates_to_unapproved: !!b.apply_rates_to_unapproved });
+  return { settings: nw, recalculated, rated };
+};
+A.callers_list = async (db) => {
+  const users = (await db.prepare(`SELECT u.id, u.name, u.username, u.phone, u.active, u.created_at, (SELECT COUNT(*) FROM contacts c WHERE c.assigned_to=u.id) assigned, (SELECT COUNT(*) FROM sessions s WHERE s.user_id=u.id AND s.revoked_at IS NULL) sessions FROM users u WHERE u.role='caller' ORDER BY u.name`).all()).results;
+  return { callers: users };
+};
+A.caller_save = async (db, u, b) => {
+  const name = str(b.name, 80), username = str(b.username, 40).toLowerCase(), phone = b.phone ? R.normPhone(b.phone) : '';
+  if (!name) bad('Enter the caller\'s name'); if (!/^[a-z0-9._-]{3,40}$/.test(username)) bad('Username: 3–40 letters/digits (no spaces)');
+  if (b.phone && !phone) bad('Phone must be a 10-digit mobile number');
+  const dup = await db.prepare(`SELECT id FROM users WHERE (username=? COLLATE NOCASE OR (phone != '' AND phone=?)) AND id IS NOT ?`).bind(username, phone || '#', b.id || null).first();
+  if (dup) bad('Another account already uses this username or phone');
+  const now = Date.now();
+  if (b.id) {
+    const ex = await db.prepare(`SELECT * FROM users WHERE id=? AND role='caller'`).bind(b.id).first(); if (!ex) bad('Caller not found');
+    const active = b.active === undefined ? ex.active : (b.active ? 1 : 0);
+    await db.prepare(`UPDATE users SET name=?, username=?, phone=?, active=?, updated_at=? WHERE id=?`).bind(name, username, phone, active, now, b.id).run();
+    if (b.password) { if (String(b.password).length < 6) bad('Password must be at least 6 characters'); await db.prepare(`UPDATE users SET pw=? WHERE id=?`).bind(await hashPw(String(b.password)), b.id).run(); await revokeUser(db, b.id, 'Your password was reset by the admin'); }
+    if (!active && ex.active) await revokeUser(db, b.id, 'Your account was deactivated by the admin');
+    await audit(db, u, 'caller_update', { id: b.id, username, active, password_reset: !!b.password }); return { id: b.id };
+  }
+  if (String(b.password || '').length < 6) bad('Password must be at least 6 characters');
+  const id = uid(); await db.prepare(`INSERT INTO users (id, role, username, phone, name, pw, active, created_at) VALUES (?, 'caller', ?, ?, ?, ?, 1, ?)`).bind(id, username, phone, name, await hashPw(String(b.password)), now).run();
+  await audit(db, u, 'caller_add', { id, username }); return { id };
+};
+A.caller_delete = async (db, u, b) => {
+  const ex = await db.prepare(`SELECT id, username FROM users WHERE id=? AND role='caller'`).bind(str(b.id, 40)).first(); if (!ex) bad('Caller not found');
+  const n = await db.prepare(`SELECT COUNT(*) n FROM calls WHERE user_id=?`).bind(ex.id).first();
+  await revokeUser(db, ex.id, 'Your account was removed by the admin');
+  await db.prepare(`UPDATE contacts SET assigned_to=NULL WHERE assigned_to=?`).bind(ex.id).run();
+  if (n.n > 0) { await db.prepare(`UPDATE users SET active=0, username=username || '.removed.' || ?, name=name || ' (removed)', phone='' WHERE id=?`).bind(uid(3), ex.id).run(); }
+  else await db.prepare(`DELETE FROM users WHERE id=?`).bind(ex.id).run();
+  await audit(db, u, 'caller_remove', { id: ex.id, username: ex.username, kept_history: n.n > 0 }); return { removed: true, kept_history: n.n > 0 };
+};
+A.sessions_list = async (db, u, b) => {
+  const q = `SELECT s.id, s.user_id, s.app, s.device, s.ip, s.created_at, s.last_seen, u.name, u.username, u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.revoked_at IS NULL` + (b.user_id ? ` AND s.user_id=?` : '') + ` ORDER BY s.last_seen DESC LIMIT 500`;
+  const st = db.prepare(q); return { sessions: (await (b.user_id ? st.bind(b.user_id) : st).all()).results.map(x => ({ ...x, current: x.id === u.sid })) };
+};
+A.session_revoke = async (db, u, b) => {
+  if (b.user_id) { await revokeUser(db, str(b.user_id, 40), 'You were logged out by the admin', u.sid); await audit(db, u, 'logout_all', { user_id: b.user_id }); return {}; }
+  await db.prepare(`UPDATE sessions SET revoked_at=?, revoke_reason='You were logged out by the admin' WHERE id=? AND id != ?`).bind(Date.now(), str(b.id, 40), u.sid).run();
+  await audit(db, u, 'logout_device', { id: b.id }); return {};
+};
+A.contacts_import = async (db, u, b) => {
+  const rows = Array.isArray(b.rows) ? b.rows.slice(0, 20000) : []; if (!rows.length) bad('The file has no rows');
+  const existing = new Set((await db.prepare(`SELECT phone FROM contacts`).all()).results.map(r => r.phone));
+  const { contacts, report } = R.cleanRows(rows, existing); const now = Date.now(); const batch = str(b.batch, 80) || ('Upload ' + new Date(now).toISOString().slice(0, 16).replace('T', ' '));
+  let callerIds = []; if (b.assign === 'rr') callerIds = (await db.prepare(`SELECT id FROM users WHERE role='caller' AND active=1 ORDER BY name`).all()).results.map(r => r.id).filter(id => !b.caller_ids || b.caller_ids.includes(id));
+  if (b.assign === 'rr' && !callerIds.length) bad('No active callers to share the numbers between — add a caller first');
+  if (b.assign === 'user' && !(await db.prepare(`SELECT id FROM users WHERE id=? AND role='caller'`).bind(str(b.user_id, 40)).first())) bad('Choose a caller');
+  const ids = contacts.map(() => uid()); const owner = new Map();
+  if (b.assign === 'rr') for (const [cid, list] of R.roundRobin(ids, callerIds)) for (const x of list) owner.set(x, cid);
+  if (b.assign === 'user') for (const x of ids) owner.set(x, b.user_id);
+  const st = contacts.map((c, i) => db.prepare(`INSERT OR IGNORE INTO contacts (id, phone, name, area, notes, assigned_to, assigned_at, status, batch, created_at) VALUES (?,?,?,?,?,?,?, 'new', ?, ?)`).bind(ids[i], c.phone, c.name, c.area, c.notes, owner.get(ids[i]) || null, owner.get(ids[i]) ? now : null, batch, now));
+  await chunked(st, 80, x => db.batch(x).then(() => []));
+  report.assigned = owner.size; await audit(db, u, 'contacts_import', { batch, ...report, invalid_rows: undefined }); return { report };
+};
+A.contacts_list = async (db, u, b) => {
+  const w = []; const p = [];
+  if (b.q) { w.push(`(c.name LIKE ? OR c.phone LIKE ? OR c.area LIKE ?)`); const q = '%' + str(b.q, 60) + '%'; p.push(q, q, q); }
+  if (b.assigned === 'none') w.push(`c.assigned_to IS NULL`); else if (b.assigned) { w.push(`c.assigned_to = ?`); p.push(b.assigned); }
+  if (b.status) { w.push(`c.status = ?`); p.push(b.status); }
+  const where = w.length ? 'WHERE ' + w.join(' AND ') : ''; const lim = Math.min(500, int(b.limit, 200)); const off = Math.max(0, int(b.offset, 0));
+  const total = (await db.prepare(`SELECT COUNT(*) n FROM contacts c ${where}`).bind(...p).first()).n;
+  const rows = (await db.prepare(`SELECT c.*, u.name caller_name FROM contacts c LEFT JOIN users u ON u.id=c.assigned_to ${where} ORDER BY c.created_at DESC, c.name LIMIT ${lim} OFFSET ${off}`).bind(...p).all()).results;
+  const counts = (await db.prepare(`SELECT COUNT(*) total, SUM(assigned_to IS NULL) unassigned FROM contacts`).first());
+  return { total, contacts: rows, counts };
+};
+A.contacts_assign = async (db, u, b) => {
+  let ids = Array.isArray(b.ids) ? b.ids.map(x => str(x, 40)) : [];
+  if (b.all_unassigned) ids = (await db.prepare(`SELECT id FROM contacts WHERE assigned_to IS NULL ORDER BY created_at, name`).all()).results.map(r => r.id);
+  if (!ids.length) bad('Select some numbers first'); const now = Date.now(); let st = [];
+  if (b.mode === 'rr') {
+    const callers = (await db.prepare(`SELECT id FROM users WHERE role='caller' AND active=1 ORDER BY name`).all()).results.map(r => r.id).filter(id => !b.caller_ids || !b.caller_ids.length || b.caller_ids.includes(id));
+    if (!callers.length) bad('No active callers');
+    for (const [cid, list] of R.roundRobin(ids, callers)) for (const x of list) st.push(db.prepare(`UPDATE contacts SET assigned_to=?, assigned_at=? WHERE id=?`).bind(cid, now, x));
+  } else {
+    const to = b.user_id ? str(b.user_id, 40) : null;
+    if (to && !(await db.prepare(`SELECT id FROM users WHERE id=? AND role='caller'`).bind(to).first())) bad('Caller not found');
+    st = ids.map(x => db.prepare(`UPDATE contacts SET assigned_to=?, assigned_at=? WHERE id=?`).bind(to, to ? now : null, x));
+  }
+  await chunked(st, 80, x => db.batch(x).then(() => [])); await audit(db, u, 'contacts_assign', { n: ids.length, mode: b.mode || 'user', user_id: b.user_id || null }); return { n: ids.length };
+};
+A.contacts_delete = async (db, u, b) => {
+  const ids = Array.isArray(b.ids) ? b.ids.map(x => str(x, 40)) : []; if (!ids.length) bad('Select some numbers first');
+  await chunked(ids.map(x => db.prepare(`DELETE FROM contacts WHERE id=?`).bind(x)), 80, x => db.batch(x).then(() => []));
+  await audit(db, u, 'contacts_delete', { n: ids.length }); return { n: ids.length };
+};
+A.calls_list = async (db, u, b) => {
+  const s = await getSettings(db); const r = rangeFrom(b, s); let rows = await callsIn(db, r.a, r.z, b.user_id || null);
+  if (b.counted === '1') rows = rows.filter(c => c.counted); if (b.counted === '0') rows = rows.filter(c => !c.counted);
+  const names = Object.fromEntries((await db.prepare(`SELECT id, name FROM users`).all()).results.map(x => [x.id, x.name]));
+  return { from: r.from, to: r.to, calls: rows.slice(0, 3000).map(c => ({ ...decorate(c), caller_name: names[c.user_id] || '' })), total: rows.length };
+};
+A.call_override = async (db, u, b) => {
+  const c = await db.prepare(`SELECT id, phone, approval_id FROM calls WHERE id=?`).bind(str(b.id, 40)).first(); if (!c) bad('Call not found');
+  if (c.approval_id) bad('This call is inside an approved payout and cannot be changed');
+  const reason = str(b.reason, 300); if (!reason) bad('Give a reason for the change');
+  if (b.kind === 'lead') await db.prepare(`UPDATE calls SET lead_override=?, lead_override_reason=? WHERE id=?`).bind(b.value === 0 ? 0 : null, reason, c.id).run();
+  else await db.prepare(`UPDATE calls SET override=?, override_reason=? WHERE id=?`).bind(b.value === 1 ? 1 : b.value === 0 ? 0 : null, reason, c.id).run();
+  await rechainPhones(db, [c.phone], await getSettings(db)); await audit(db, u, 'call_override', { id: c.id, kind: b.kind || 'call', value: b.value, reason });
+  return { call: decorate(await db.prepare(`SELECT * FROM calls WHERE id=?`).bind(c.id).first()) };
+};
+A.dashboard = async (db, u, b) => {
+  const s = await getSettings(db); const today = R.dayKey(Date.now(), s.tz_offset_min);
+  const wk = R.dayKey(R.dayStart(today, s.tz_offset_min) - 6 * 86400000 + 3600000, s.tz_offset_min); const mo = today.slice(0, 8) + '01';
+  const [t, w, m] = await Promise.all([perCaller(db, s, today, today), perCaller(db, s, wk, today), perCaller(db, s, mo, today)]);
+  const leadsOpen = (await db.prepare(`SELECT COUNT(*) n FROM contacts WHERE status='interested' AND COALESCE(lead_state,'open')='open'`).first()).n;
+  const due = (await db.prepare(`SELECT COUNT(*) n FROM contacts WHERE (followup_at IS NOT NULL AND followup_at <= ? AND COALESCE(lead_state,'open')='open') OR (status='callback' AND callback_at <= ?)`).bind(Date.now() + 86400000, Date.now() + 86400000).first()).n;
+  const counts = await db.prepare(`SELECT COUNT(*) total, SUM(assigned_to IS NULL) unassigned, SUM(status='new') fresh FROM contacts`).first();
+  return { today: t, week: w, month: m, ranges: { today: [today, today], week: [wk, today], month: [mo, today] }, leads_open: leadsOpen, due, contacts: counts, settings: s };
+};
+A.payout_report = async (db, u, b) => {
+  const s = await getSettings(db); const r = rangeFrom(b, s); const rows = await perCaller(db, s, r.from, r.to, b.user_id || null);
+  const adj = await adjIn(db, r.from, r.to, b.user_id || null);
+  const appr = (await db.prepare(`SELECT a.*, u.name FROM approvals a JOIN users u ON u.id=a.user_id ORDER BY a.approved_at DESC LIMIT 200`).all()).results;
+  const days = []; if (b.daily) { for (let d = R.dayStart(r.from, s.tz_offset_min); d < r.z; d += 86400000) { const k = R.dayKey(d + 3600000, s.tz_offset_min); days.push({ day: k, rows: await perCaller(db, s, k, k, b.user_id || null) }); } }
+  return { from: r.from, to: r.to, rows, adjustments: adj, approvals: appr, days, settings: s };
+};
+A.adjustment_add = async (db, u, b) => {
+  const amount = Number(b.amount); if (!isFinite(amount) || amount === 0 || Math.abs(amount) > 1e6) bad('Enter an amount (use minus for a deduction)');
+  const reason = str(b.reason, 300); if (!reason) bad('Give a reason'); if (!/^\d{4}-\d{2}-\d{2}$/.test(b.day || '')) bad('Choose a date');
+  if (!(await db.prepare(`SELECT id FROM users WHERE id=? AND role='caller'`).bind(str(b.user_id, 40)).first())) bad('Choose a caller');
+  const id = uid(); await db.prepare(`INSERT INTO adjustments (id, user_id, day, amount, reason, created_by, created_at) VALUES (?,?,?,?,?,?,?)`).bind(id, b.user_id, b.day, Math.round(amount * 100) / 100, reason, u.id, Date.now()).run();
+  await audit(db, u, 'adjustment_add', { id, user_id: b.user_id, day: b.day, amount, reason }); return { id };
+};
+A.adjustment_delete = async (db, u, b) => {
+  const a = await db.prepare(`SELECT * FROM adjustments WHERE id=?`).bind(str(b.id, 40)).first(); if (!a) bad('Not found'); if (a.approval_id) bad('Inside an approved payout');
+  await db.prepare(`DELETE FROM adjustments WHERE id=?`).bind(a.id).run(); await audit(db, u, 'adjustment_delete', a); return {};
+};
+A.payout_approve = async (db, u, b) => {
+  const s = await getSettings(db); const r = rangeFrom(b, s); const userId = str(b.user_id, 40);
+  const [row] = await perCaller(db, s, r.from, r.to, userId); if (!row) bad('Caller not found');
+  const id = uid(); const now = Date.now();
+  await db.prepare(`INSERT INTO approvals (id, user_id, from_day, to_day, made, counted, leads, call_amount, lead_amount, adjust, payout, note, approved_by, approved_at, paid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .bind(id, userId, r.from, r.to, row.made, row.counted, row.leads, row.call_amount, row.lead_amount, row.adjust, row.payout, str(b.note, 300), u.id, now, b.paid ? 1 : 0).run();
+  await db.prepare(`UPDATE calls SET approval_id=? WHERE user_id=? AND approval_id IS NULL AND COALESCE(start_ts, tapped_at) >= ? AND COALESCE(start_ts, tapped_at) < ?`).bind(id, userId, r.a, r.z).run();
+  await db.prepare(`UPDATE adjustments SET approval_id=? WHERE user_id=? AND approval_id IS NULL AND day >= ? AND day <= ?`).bind(id, userId, r.from, r.to).run();
+  await audit(db, u, 'payout_approve', { id, user_id: userId, from: r.from, to: r.to, payout: row.payout }); return { id, payout: row.payout };
+};
+A.payout_mark_paid = async (db, u, b) => { await db.prepare(`UPDATE approvals SET paid=? WHERE id=?`).bind(b.paid ? 1 : 0, str(b.id, 40)).run(); await audit(db, u, 'payout_paid', b); return {}; };
+A.payout_unapprove = async (db, u, b) => {
+  const id = str(b.id, 40); await db.prepare(`UPDATE calls SET approval_id=NULL WHERE approval_id=?`).bind(id).run(); await db.prepare(`UPDATE adjustments SET approval_id=NULL WHERE approval_id=?`).bind(id).run();
+  await db.prepare(`DELETE FROM approvals WHERE id=?`).bind(id).run(); await audit(db, u, 'payout_unapprove', { id, reason: str(b.reason, 300) }); return {};
+};
+A.leads_list = async (db, u, b) => {
+  const st = b.state || 'open'; const w = [`c.status='interested' OR c.lead_state IS NOT NULL OR c.status='callback'`];
+  const rows = (await db.prepare(`SELECT c.*, u.name caller_name, (SELECT MAX(COALESCE(start_ts, tapped_at)) FROM calls x WHERE x.contact_id=c.id AND x.outcome='interested') interested_at FROM contacts c LEFT JOIN users u ON u.id=c.assigned_to WHERE ${w[0]} ORDER BY COALESCE(c.followup_at, c.callback_at, 9e15), c.last_call_at DESC LIMIT 2000`).all()).results;
+  const out = rows.filter(r => st === 'all' ? true : st === 'callback' ? r.status === 'callback' : (r.status === 'interested' || r.lead_state) && (r.lead_state || 'open') === st);
+  return { leads: out };
+};
+A.lead_update = async (db, u, b) => {
+  const id = str(b.id, 40); const c = await db.prepare(`SELECT id FROM contacts WHERE id=?`).bind(id).first(); if (!c) bad('Not found');
+  const states = ['open', 'won', 'closed']; const ls = states.includes(b.lead_state) ? b.lead_state : null;
+  await db.prepare(`UPDATE contacts SET lead_state=COALESCE(?, lead_state), followup_at=?, followup_note=? WHERE id=?`).bind(ls, int(b.followup_at), str(b.followup_note, 500), id).run();
+  await audit(db, u, 'lead_update', { id, lead_state: ls, followup_at: int(b.followup_at) }); return {};
+};
+A.recalc_all = async (db, u) => { const n = await recalcAll(db); await audit(db, u, 'recalc_all', { n }); return { n }; };
+A.audit_list = async (db) => ({ audit: (await db.prepare(`SELECT a.*, u.name FROM audit a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC LIMIT 300`).all()).results });
+
+async function api(req, env, method) {
+  const db = env.DB; await init(db);
+  if (method === 'health') return { ok: true, app: 'rs-calling', version: VERSION, time: Date.now() };
+  if (req.method !== 'POST') throw new ApiError(405, 'POST only');
+  if (req.headers.get('x-rsc') !== '1') throw new ApiError(400, 'Missing client header');
+  let b = {}; try { b = await req.json(); } catch { b = {}; }
+  if (method === 'login') return login(db, b, req);
+  const u = await authUser(db, req);
+  if (M[method]) return M[method](db, u, b, req);
+  if (A[method]) { if (u.role !== 'admin') throw new ApiError(403, 'Admin only'); return A[method](db, u, b, req); }
+  throw new ApiError(404, 'Unknown action');
+}
+
+export default {
+  async fetch(req, env) {
+    const url = new URL(req.url);
+    if (url.pathname.startsWith('/api/')) {
+      const method = url.pathname.slice(5).replace(/\/+$/, '');
+      try { return json({ ok: true, ...(await api(req, env, method)) }); }
+      catch (e) { const st = e instanceof ApiError ? e.status : 500; if (st === 500) console.log('api error', method, e && e.stack); return json({ ok: false, error: st === 500 ? 'Server error, please try again' : e.message, ...(e.extra || {}) }, st); }
+    }
+    if (url.pathname === '/admin' || url.pathname === '/admin/') return Response.redirect(url.origin + '/app/?admin=1', 302);
+    if (APK && url.pathname === '/download/' + APK.name) {
+      const r = await env.ASSETS.fetch(new Request(url.origin + '/files/' + APK.name, req));
+      if (!r.ok) return r; const h = new Headers(r.headers); h.set('content-type', 'application/vnd.android.package-archive'); h.set('content-disposition', `attachment; filename="${APK.name}"`); h.set('cache-control', 'no-cache');
+      return new Response(r.body, { status: 200, headers: h });
+    }
+    const r = await env.ASSETS.fetch(req);
+    if (url.pathname.startsWith('/app/') || url.pathname === '/') { const h = new Headers(r.headers); h.set('cache-control', 'no-cache'); h.set('x-frame-options', 'DENY'); h.set('referrer-policy', 'no-referrer'); return new Response(r.body, { status: r.status, headers: h }); }
+    return r;
+  },
+};

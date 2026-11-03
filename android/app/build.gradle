@@ -1,0 +1,29 @@
+apply plugin: 'com.android.application'
+// R&S Calling for Android. Release signing: properties file OUTSIDE the source tree (env RSC_SIGNING_PROPS) with
+// storeFile, storePassword, keyAlias, keyPassword. Every update MUST be signed with the same key.
+def ksFile = file(System.getenv('RSC_SIGNING_PROPS') ?: '/nonexistent')
+android {
+    namespace 'bot.tab.sites.rscalling'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'bot.tab.sites.rscalling'
+        minSdk 24
+        targetSdk 34
+        versionCode 100
+        versionName '1.0.0'
+        buildConfigField 'boolean', 'WEB_DEBUG', (System.getenv('RSC_WEBDEBUG') == '1' ? 'true' : 'false')
+        manifestPlaceholders = [cleartext: (System.getenv('RSC_WEBDEBUG') == '1' ? 'true' : 'false')]
+        buildConfigField 'String', 'SERVER', '"' + (System.getenv('RSC_SERVER') ?: 'https://rs-calling.sites.tab.bot') + '"'
+    }
+    signingConfigs {
+        release {
+            if (ksFile.exists()) {
+                def p = new Properties(); ksFile.withInputStream { p.load(it) }
+                def sf = new File(p['storeFile']); if (!sf.isAbsolute()) sf = new File(ksFile.parentFile, p['storeFile']); storeFile sf; storePassword p['storePassword']; keyAlias p['keyAlias']; keyPassword p['keyPassword']
+            }
+        }
+    }
+    buildFeatures { buildConfig true }
+    buildTypes { release { if (ksFile.exists()) signingConfig signingConfigs.release; minifyEnabled false } }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+}
