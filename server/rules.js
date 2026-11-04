@@ -132,8 +132,8 @@ export function dayFlags(dayCalls, settings) {
 const r2 = n => Math.round(n * 100) / 100;
 
 /** Totals for one caller over a set of (already evaluated) calls + adjustments. Calls carry call_rate/lead_rate snapshots. */
-export function totals(calls, adjustments = []) {
-  const t = { made: calls.length, connected: 0, counted: 0, leads: 0, interested: 0, talk_s: 0, call_amount: 0, lead_amount: 0, adjust: 0 };
+export function totals(calls, adjustments = [], callbacks = []) {
+  const t = { made: calls.length, connected: 0, counted: 0, leads: 0, interested: 0, talk_s: 0, call_amount: 0, lead_amount: 0, adjust: 0, callbacks: callbacks.length, callbacks_counted: 0, callback_amount: 0 };
   for (const c of calls) {
     if (c.duration > 0) { t.connected++; t.talk_s += c.duration; }
     if (c.outcome === 'interested') t.interested++;
@@ -141,9 +141,10 @@ export function totals(calls, adjustments = []) {
     if (c.lead_counted) { t.leads++; t.lead_amount += Number(c.lead_rate) || 0; }
   }
   for (const a of adjustments) t.adjust += Number(a.amount) || 0;
+  for (const b of callbacks) if (b.counted) { t.callbacks_counted++; t.callback_amount += Number(b.rate) || 0; }
   t.connect_rate = t.made ? r2(100 * t.connected / t.made) : 0;
-  t.call_amount = r2(t.call_amount); t.lead_amount = r2(t.lead_amount); t.adjust = r2(t.adjust);
-  t.payout = r2(t.call_amount + t.lead_amount + t.adjust);
+  t.call_amount = r2(t.call_amount); t.lead_amount = r2(t.lead_amount); t.adjust = r2(t.adjust); t.callback_amount = r2(t.callback_amount);
+  t.payout = r2(t.call_amount + t.lead_amount + t.callback_amount + t.adjust);
   return t;
 }
 
@@ -170,3 +171,178 @@ export function cleanRows(rows, existingPhones = new Set()) {
   });
   rep.added = good.length; return { contacts: good, report: rep };
 }
+
+
+// ================= v1.1 additions =================
+export const DEFAULTS11 = {
+  min_withdrawal: 100,      // ₹ smallest withdrawal a caller can request
+  retention_days: 7,        // days a caller's own call/log copies stay in the app after they are safely synced
+  daily_target: 10,         // counted calls per India day = "daily task done" (streak)
+  streak_bonus_7: 0,        // ₹ bonus when a streak reaches 7 days (0 = off)
+  streak_bonus_30: 0,       // ₹ bonus when a streak reaches 30 days (0 = off)
+  callback_counts: 0,       // 1 = a long enough callback from a called number also earns the per-call rate
+  callback_window_days: 30, // an incoming call from a number counts as a callback for this long after the last app call to it
+  withdraw_hours: 16,       // admin pays within this many hours of the request
+  log_access_hours: 48,     // an approved log request stays viewable this long
+  streak_bonus_since: 0,    // yyyymmdd the bonus was switched on (internal: no back-dated bonuses)
+};
+Object.assign(DEFAULTS, DEFAULTS11);
+
+// ---- payment details validation ----
+export const UPI_RE = /^[a-zA-Z0-9._-]{2,64}@[a-zA-Z][a-zA-Z0-9]{1,31}$/;
+export const IFSC_RE = /^[A-Z]{4}0[A-Z0-9]{6}$/;
+export const ACCT_RE = /^[0-9]{9,18}$/;
+export const isUpi = v => UPI_RE.test(String(v || '').trim());
+export const isIfsc = v => IFSC_RE.test(String(v || '').trim().toUpperCase());
+export const isAcct = v => ACCT_RE.test(String(v || '').replace(/[\s-]/g, ''));
+/** Validate the fields a caller typed. `cur` = what is stored now. Returns {error} or {value}. A field that is undefined keeps its stored value. */
+export function validatePayment(b, cur = {}) {
+  const v = { upi: cur.upi || '', holder: cur.holder || '', account_no: cur.account_no || '', ifsc: cur.ifsc || '', bank: cur.bank || '' };
+  const t = x => String(x == null ? '' : x).trim();
+  if (b.upi !== undefined) { v.upi = t(b.upi).toLowerCase(); if (v.upi && !isUpi(v.upi)) return { error: 'UPI ID looks wrong. Example: name@okbank' }; }
+  const bankKeys = ['holder', 'account_no', 'ifsc', 'bank'];
+  if (bankKeys.some(k => b[k] !== undefined)) {
+    for (const k of bankKeys) if (b[k] !== undefined) v[k] = t(b[k]);
+    v.account_no = v.account_no.replace(/[\s-]/g, ''); v.ifsc = v.ifsc.toUpperCase();
+    const any = bankKeys.some(k => v[k]);
+    if (any) {
+      if (!v.holder || v.holder.length < 2 || v.holder.length > 80) return { error: 'Enter the account holder name as it is on the bank account' };
+      if (!ACCT_RE.test(v.account_no)) return { error: 'Account number must be 9 to 18 digits' };
+      if (!IFSC_RE.test(v.ifsc)) return { error: 'IFSC must be 11 characters, e.g. SBIN0001234 (4 letters, 0, then 6 letters/digits)' };
+      if (!v.bank || v.bank.length < 2 || v.bank.length > 80) return { error: 'Enter the bank name' };
+    }
+  }
+  const hasUpi = !!v.upi, hasBank = !!(v.holder && v.account_no && v.ifsc && v.bank);
+  if (!hasUpi && !hasBank) return { error: 'Add a UPI ID or your bank details (or both)' };
+  return { value: v };
+}
+export const maskUpi = u => { u = String(u || ''); const i = u.indexOf('@'); if (i < 0) return ''; const a = u.slice(0, i); return (a.length <= 2 ? a[0] + '*' : a.slice(0, 2) + '*'.repeat(Math.min(6, a.length - 2))) + u.slice(i); };
+export const maskAcct = a => { a = String(a || ''); return a.length < 5 ? '' : '*'.repeat(a.length - 4) + a.slice(-4); };
+/** UPI deep link: payee = caller's UPI id. Amount to 2 decimals. */
+export function upiLink({ pa, pn, am, tn }) {
+  const q = [['pa', pa], ['pn', pn], ['am', Number(am).toFixed(2)], ['cu', 'INR'], ['tn', tn]].filter(x => x[1]).map(([k, v]) => k + '=' + encodeURIComponent(String(v)).replace(/%40/g, '@'));
+  return 'upi://pay?' + q.join('&');
+}
+
+// ---- wallet / withdrawals ----
+/** Wallet numbers (₹) from stored totals. earned = all-time payout; approved = sum of approved payouts; paidOffline = approved payouts marked paid outside the app. */
+export function walletCalc({ earned = 0, approved = 0, paidOffline = 0, withdrawals = [] }) {
+  let withdrawn = 0, reserved = 0;
+  for (const w of withdrawals) { if (w.status === 'paid') withdrawn += Number(w.amount) || 0; else if (w.status === 'pending') reserved += Number(w.amount) || 0; }
+  const approvedFree = r2(approved - paidOffline);
+  return { raw_available: r2(approvedFree - withdrawn - reserved), total_earned: r2(earned), approved: r2(approved), pending_approval: r2(Math.max(0, earned - approved)), withdrawn: r2(withdrawn), reserved: r2(reserved), available: r2(Math.max(0, approvedFree - withdrawn - reserved)) };
+}
+export function checkWithdraw(amount, wallet, s, hasDetails) {
+  const a = Number(amount);
+  if (!hasDetails) return 'Add your UPI ID or bank details first';
+  if (!isFinite(a) || a <= 0) return 'Enter an amount';
+  if (Math.round(a * 100) !== a * 100 && Math.abs(Math.round(a * 100) - a * 100) > 1e-6) return 'Amount can have at most 2 decimals';
+  if (a < s.min_withdrawal) return `Minimum withdrawal is ₹${s.min_withdrawal}`;
+  if (a > wallet.available + 1e-9) return `You can withdraw at most ₹${wallet.available}`;
+  return null;
+}
+export const dueAt = (requestedAt, hours) => Number(requestedAt) + Number(hours) * 3600000;
+export const isOverdue = (w, now) => w.status === 'pending' && now > w.due_at;
+
+// ---- callbacks ----
+/** Which phone-log entries are callbacks. entries: [{number,date,duration,type}] (type incoming|missed|outgoing). called: Map phone -> {first, last}.
+ *  appCallTimes: Set of start times of calls already recorded from the app (so an outgoing app call is not read as anything else).
+ *  Returns {events:[{phone,start_ts,duration,kind}], returned:[{phone,out_ts}], skipped:[{phone,date,reason}]} */
+export function matchCallbacks(entries, called, s, appCallTimes = new Set()) {
+  const events = [], returned = [], skipped = []; const win = (s.callback_window_days || 30) * 86400000;
+  for (const e of entries) {
+    const phone = normPhone(e.number); const date = Number(e.date); const type = String(e.type || '');
+    if (!phone || !isFinite(date)) { skipped.push({ phone, date, reason: 'bad_entry' }); continue; }
+    const c = called.get(phone);
+    if (!c) { skipped.push({ phone, date, reason: 'not_called_from_app' }); continue; }
+    if (type === 'incoming' || type === 'missed') {
+      if (date < c.first) { skipped.push({ phone, date, reason: 'before_first_app_call' }); continue; }
+      if (date > c.last + win) { skipped.push({ phone, date, reason: 'outside_window' }); continue; }
+      events.push({ phone, start_ts: date, duration: type === 'missed' ? 0 : Math.max(0, Math.round(Number(e.duration) || 0)), kind: type });
+    } else if (type === 'outgoing') {
+      if ([...appCallTimes].some(t => Math.abs(t - date) <= 15000)) { skipped.push({ phone, date, reason: 'app_call' }); continue; }
+      if (date >= c.first) returned.push({ phone, out_ts: date }); else skipped.push({ phone, date, reason: 'before_first_app_call' });
+    } else skipped.push({ phone, date, reason: 'other_type' });
+  }
+  return { events, returned, skipped };
+}
+/** Which callback events earn pay. events for ONE or many numbers; returns Map id -> {counted, reason}. Default: nothing counts (callback_counts = 0). */
+export function callbackCounting(events, s) {
+  const res = new Map(); const byP = new Map();
+  for (const e of events) (byP.get(e.phone) || byP.set(e.phone, []).get(e.phone)).push(e);
+  for (const list of byP.values()) {
+    list.sort((a, b) => a.start_ts - b.start_ts); let last = -Infinity;
+    for (const e of list) {
+      let counted = false, reason;
+      if (!s.callback_counts) reason = 'Callbacks are recorded but not paid';
+      else if (e.kind !== 'incoming' || !(e.duration > 0)) reason = 'Missed callback';
+      else if (e.duration < s.min_duration) reason = 'Callback shorter than the minimum duration';
+      else if (e.start_ts - last < s.repeat_hours * 3600000) reason = 'Another counted callback from this number inside the repeat window';
+      else { counted = true; reason = 'Counted callback'; last = e.start_ts; }
+      res.set(e.id, { counted, reason });
+    }
+  }
+  return res;
+}
+
+// ---- streak ----
+/** dayCounts: {dayKey: counted calls}. Returns current / longest streak, today's progress, last-14-days strip. */
+export function streakCalc(dayCounts, target, today) {
+  const T = Math.max(1, Math.round(Number(target) || 1)); const done = d => (dayCounts[d] || 0) >= T;
+  const prev = d => dayKey(dayStart(d, 0) - 3600000, 0);   // previous calendar day key (dayStart with tz 0 = UTC midnight of the key)
+  const next = d => dayKey(dayStart(d, 0) + 86400000 + 3600000, 0);
+  let cur = 0, d = done(today) ? today : prev(today);
+  while (done(d)) { cur++; d = prev(d); }
+  const keys = Object.keys(dayCounts).filter(done).sort(); let longest = 0, run = 0, last = null;
+  for (const k of keys) { run = last && next(last) === k ? run + 1 : 1; longest = Math.max(longest, run); last = k; }
+  const days14 = []; let x = today; for (let i = 0; i < 14; i++) { days14.unshift({ day: x, count: dayCounts[x] || 0, done: done(x) }); x = prev(x); }
+  return { current: cur, longest, target: T, today_count: dayCounts[today] || 0, today_done: done(today), days14 };
+}
+/** Days on which a run of consecutive done-days reached 7 and 30 days. Returns [{milestone, day, run_start}] */
+export function streakMilestones(dayCounts, target) {
+  const T = Math.max(1, Math.round(Number(target) || 1)); const keys = Object.keys(dayCounts).filter(k => (dayCounts[k] || 0) >= T).sort();
+  const next = d => dayKey(dayStart(d, 0) + 86400000 + 3600000, 0); const out = []; let run = 0, last = null, start = null;
+  for (const k of keys) {
+    if (last && next(last) === k) run++; else { run = 1; start = k; }
+    if (run === 7 || run === 30) out.push({ milestone: run, day: k, run_start: start });
+    last = k;
+  }
+  return out;
+}
+
+// ---- retention (server view of a caller's own logs) ----
+export const retentionCutoff = (now, days) => now - Math.max(1, Number(days) || 7) * 86400000;
+
+// ---- CSV ----
+/** CSV with spreadsheet-formula protection. */
+export function csvCell(v) {
+  let s = v == null ? '' : String(v);
+  if (/^[=+\-@\t\r]/.test(s) && !/^[-+]?\d+(\.\d+)?$/.test(s)) s = "'" + s;
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+export const toCsv = (cols, rows) => '\ufeff' + [cols.map(csvCell).join(','), ...rows.map(r => r.map(csvCell).join(','))].join('\r\n') + '\r\n';
+export const LOG_COLS = ['Record', 'Date', 'Time (IST)', 'Caller', 'Client name', 'Client number', 'Talk time (s)', 'Connected', 'Counted', 'Reason', 'Outcome', 'Lead counted', 'Callback date', 'Notes', 'Callback event', 'Callback counted'];
+
+// ---- Terms & Conditions ----
+export const TERMS_V1_DATE = '4 November 2026';
+export const TERMS_V1 = `R&S Calling — Terms & Conditions
+Version 1 · ${TERMS_V1_DATE}
+
+By using R&S Calling you agree to these Terms.
+
+1. Withdrawals are processed within 16 hours of the request. The admin pays the amount to the UPI ID or bank account you saved. Withdrawals need valid payment details, and you are responsible for their correctness.
+2. Speak to every client in a proper, formal and respectful manner. No abuse, no anger and no aggressive language, ever.
+3. The tasks given to you must be completed every day.
+4. You have a formal working relationship with the company and must behave professionally at all times.
+5. No call, no money. Only verified, counted calls and approved leads are paid.
+6. No fake information. Fake leads, wrong data, fake calls and manipulating call records are strictly prohibited.
+7. Any breach of these Terms may lead to legal action.
+8. Every counted call must include a conversation of at least 30 seconds (or the minimum the admin has set in the app).
+9. Call-log and activity tracking: you agree that the app records the calls you make from it for work purposes: the client number, time, duration, result and your notes. Call audio is never recorded. The app reads your phone's call history only to check the calls you made from the app and any callbacks from clients you called.
+10. Client data is confidential. Do not share, copy, or use client names or numbers for any other purpose, during or after your work.
+11. One account per person. Do not share your login with anyone.
+12. Payouts are subject to admin verification. Fraud, duplicate calls and calls that do not meet the rules are excluded, and the company may hold or reverse earnings that are found to be fraudulent.
+13. The admin may suspend or remove an account for any breach of these Terms.
+14. The company may update these Terms. When they change you must accept the new version before you can continue using the app.
+15. You must follow Indian law, including telecom and Do-Not-Disturb (DND) rules, whenever you call a client.
+16. These Terms are governed by the laws of India.`;

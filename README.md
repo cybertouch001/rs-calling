@@ -44,3 +44,18 @@ The signing key and admin password are kept outside this repository.
 
 Apps that read the call log need Google's special permission approval (Call log permission declaration), so the APK is shared
 by link from the website instead of the Play Store.
+
+## v1.1.0 (4 Nov 2026)
+- **Caller account** screen with wallet (earned / approved / pending / withdrawn / available), username, payment details (UPI or bank, validated, shown masked).
+- **Withdrawals**: balance reserved while pending, 16-hour payout deadline (admin-editable), admin queue with overdue highlight, UPI QR + `upi://` link, mark paid (UTR) / reject (reason), Excel export. The app does not move money — the admin pays in their own UPI app.
+- **Callback matching**: incoming/missed calls from numbers called through the app are recorded and attached to the client. Records only by default; an admin switch makes long incoming callbacks payable.
+- **Auto-delete on the phone**: the app's own synced copies are removed after the retention period (default 7 days; admin setting). The phone's system call log is never touched.
+- **Log requests**: a caller asks to see old logs with a purpose; the admin approves or rejects.
+- **Admin log files**: daily and all-time, Excel and CSV, plus an automatic daily snapshot.
+- **Terms & Conditions**: versioned, editable by the admin, acceptance gate for every caller (default text v1 in `server/rules.js`; not legal advice).
+- **Help** chat: rule-based (no external AI), English + Hinglish keywords, refuses off-topic questions.
+- **Streak**: computed on the server from counted calls per day; optional bonus at 7 / 30 days (0 by default).
+- UI polish with the v1.0 colour palette unchanged.
+
+Tests: `node --test test/rules.test.mjs test/rules11.test.mjs test/help.test.mjs` (unit), `test/api.test.mjs` + `test/api11.test.mjs` (API, against a local worker), `test/pw_admin1.py` + `test/pw_flow2.py` + `test/pw_v11.py` (Playwright with a simulated Android bridge), `test/live_test.py` (live, non-destructive).
+The Android shell is unchanged apart from the version (1.1.0 / versionCode 110); it has **not** been run on a phone or emulator.

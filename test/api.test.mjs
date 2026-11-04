@@ -23,7 +23,7 @@ assert.equal(imp.report.added, 4); assert.equal(imp.report.dup_in_file, 1); asse
 const imp2 = await ok('contacts_import', { rows: [{ Name: 'C2b', Phone: ph(2) }, { Name: 'C5', Phone: ph(5) }], assign: 'user', user_id: u1 }, admin);
 assert.equal(imp2.report.dup_existing, 1); assert.equal(imp2.report.added, 1); step('import: dedupe against existing');
 const t1 = (await ok('login', { login: P + 'one', password: 'secret123', app: 'android', device: 'Test Phone 1' })).token;
-const t2 = (await ok('login', { login: P + 'two', password: 'secret456', app: 'android', device: 'Test Phone 2' })).token; step('callers log in');
+const t2 = (await ok('login', { login: P + 'two', password: 'secret456', app: 'android', device: 'Test Phone 2' })).token; for (const tk of [t1, t2]) await ok('terms_accept', { version: (await ok('terms_current', {}, tk)).terms.version }, tk); step('callers log in and accept the Terms');
 assert.equal((await call('callers_list', {}, t1))._status, 403); step('caller cannot use admin API');
 const L1 = (await ok('my_list', {}, t1)).contacts; const L2 = (await ok('my_list', {}, t2)).contacts;
 assert.equal(L1.length + L2.length, 5); assert.ok(L1.length >= 2 && L2.length >= 2); step(`lists: caller1 ${L1.length}, caller2 ${L2.length}`);

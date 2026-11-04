@@ -20,7 +20,7 @@ async def main():
         b = await p.chromium.launch()
         cc = await b.new_context(viewport={'width': 390, 'height': 844}, device_scale_factor=2, is_mobile=True, has_touch=True)
         await cc.add_init_script(FAKE); c = await cc.new_page(); errs = []; c.on('pageerror', lambda e: errs.append(str(e)))
-        await c.goto(BASE + '/app/'); await c.fill('#lu', P + 'ravi'); await c.fill('#lp', 'test1234'); await c.click('#lb'); await c.wait_for_selector('.callb', timeout=15000)
+        await c.goto(BASE + '/app/'); await c.fill('#lu', P + 'ravi'); await c.fill('#lp', 'test1234'); await c.click('#lb'); await c.wait_for_selector('#tk', timeout=15000); await c.screenshot(path=SHOTS + '/rscalling-v11-caller-terms-gate.png'); await c.check('#tk'); await c.click('#ta'); await c.wait_for_selector('.callb', timeout=15000)
         n = await c.locator('.callb').count(); ok(f'caller Ravi logs in (simulated Android bridge), sees {n} assigned numbers')
         await c.screenshot(path=SHOTS + '/rscalling-10-caller-list.png')
         async def do_call(idx, dur, outcome, note='', cb=None, shot=None):
@@ -77,7 +77,7 @@ async def main():
         async with a.expect_download() as d5: await a.click('#px')
         await (await d5.value).save_as(SHOTS + '/export-payout.xlsx'); ok('payout PDF + Excel downloaded')
         await a.locator('tr', has_text='Ravi').locator('[data-ap]').click(); await a.wait_for_selector('#aps'); await a.click('#aps'); await a.wait_for_timeout(1200)
-        assert 'Not paid' in await a.text_content('main'); ok('payout approved (locked)')
+        assert 'Available to withdraw' in await a.text_content('main'); ok('payout approved (locked)')
         await a.screenshot(path=SHOTS + '/rscalling-08b-payouts-approved.png', full_page=True)
         # leads
         await a.click('[data-t=leads]'); await a.wait_for_selector('[data-l]'); await a.wait_for_timeout(400)
