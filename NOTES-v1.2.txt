@@ -1,0 +1,33 @@
+R&S Calling v1.2.0 — built 4 Nov 2026.
+
+WHAT CHANGED
+- Admin > Numbers > Upload client numbers: Excel/CSV upload with automatic detection and a preview. Parsing and detection run in the browser with the bundled SheetJS (site/app/vendor/xlsx.full.min.js); no network service. Pure logic in site/app/importer.js (window.RSI).
+- Server (server/worker.js): new admin actions import_start, import_chunk, import_finish, import_check, import_list, import_undo. New table import_batches; contacts gets import_id and source (columns added only when missing, existing rows untouched). Existing contacts_import action kept for compatibility (no longer used by the page).
+- Undo: removes only the contacts whose import_id is that batch, and only when none of them has a call, callback, status change, follow-up or lead state. Otherwise refused with a plain message.
+- Dedupe: against numbers already in the list (server, per chunk) and within the file (browser). Landlines, junk (repeated digits), 10-digit numbers not starting 6-9, text and rows without a number are skipped with a reason.
+- Help: a new topic on uploads (rule-based), added to the sample questions.
+- Terms: NOT changed. The uploaded numbers are the business's own lead data; no caller-facing terms text needed a line. (T&C is a template, not legal advice.)
+- Version 1.2.0 / versionCode 120 (in place update of 1.1.0, same key).
+
+DEFAULTS CHOSEN
+- Default phone column: the header-named phone column with the most valid numbers; other phone-number columns are also read (checkbox on the preview). Numbers written inside words are read only from the chosen phone column.
+- Default sheet: the sheet with the most valid numbers.
+- Default assignment: keep unassigned.
+- Limits: 5 MB, 20,000 data rows. Skipped list capped at 5,000 rows on screen and in the file.
+- A number that is already in the list is never re-added or re-assigned.
+
+TESTS (worker's own run; not independently verified)
+- node --test test/importer.test.mjs: 10 tests (messy formats, landlines, multi-number cells, title rows, no-header sheets, overrides, two-sheet book, CSV, limits, and the two real lead workbooks when RSC_LEAD_FILES is set: 9 rows/5 numbers and 116 rows/109 numbers/1 landline, matching an openpyxl count).
+- node --test rules.test.mjs rules11.test.mjs help.test.mjs: existing tests, all pass with the new help topic.
+- test/api12.test.mjs against a local v1.2 worker: 18 checks (round-robin, dedupe, undo refused after a call, undo clean upload, unfinished upload undo, admin-only).
+- test/pw_v12.py (Chromium, 390x844, mobile emulation): 14 checks on real .xlsx files: the two lead workbooks (the Varanasi file was not run through the browser; it is covered by the node test) and a generated messy workbook. No JavaScript errors.
+- Migration: a database built by the v1.1.0 worker (seeded by the v1.1 test runs) was copied and opened with the v1.2.0 worker: settings, callers, calls, payout report, dashboard and contacts identical (contacts only gained the two new null columns). Withdrawals identical apart from the timestamp of the read.
+
+NOT TESTED
+- The APK was not run on a phone or emulator (no /dev/kvm). Only the build, the signature and the manifest were checked.
+- File picker inside the Android WebView for the new upload: the existing file chooser hook was not changed, but not exercised on a device.
+- Real-world Excel files beyond the two lead workbooks and one generated messy sheet (for example password-protected files, .xls from old Excel, very wide sheets).
+- Load: 20,000 rows were only checked for the detector's row ceiling, not uploaded end to end.
+
+FILES NOT IN THE REPO
+- private/ (signing kit, admin password, live backup snapshot), out-*/ builds, the APK (attached to the release), the lead workbooks (business data).

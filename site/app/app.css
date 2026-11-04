@@ -78,3 +78,7 @@ tr.over td{background:var(--badbg)}tr.over td:first-child{box-shadow:inset 3px 0
 @media(max-width:420px){.card{padding:13px}.w6{grid-template-columns:repeat(2,1fr)}}
 
 .pill{max-width:100%;overflow-x:auto;scrollbar-width:none}.pill::-webkit-scrollbar{display:none}.pill button{white-space:nowrap;padding:6px 11px;font-size:13.5px}
+
+/* v1.2: upload preview */
+.mapgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.mapgrid select{width:100%}
+.stat{background:#f4f7fb;border-radius:10px;padding:8px 10px}.stat b{display:block;font-size:20px;color:var(--navy)}.stat span{font-size:12px;color:#5c6b80}

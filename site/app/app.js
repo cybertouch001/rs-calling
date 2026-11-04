@@ -414,7 +414,8 @@
   let numQ = { q: '', assigned: '', status: '', offset: 0 };
   ADMIN.numbers = async (main) => {
     await callers(); const j = await api('contacts_list', { ...numQ, limit: 200 });
-    main.innerHTML = `<div class="card"><h2>Upload client numbers</h2><div class="drop"><p style="margin:0 0 8px">Excel (.xlsx / .xls) or CSV with columns <b>Name, Phone, Area, Notes</b></p><input type="file" id="uf" accept=".xlsx,.xls,.csv"> <a href="#" id="tpl" class="small">Download a sample file</a></div><div id="up"></div></div>
+    main.innerHTML = `<div class="card" id="upcard"><h2>Upload client numbers</h2><p class="mut small" style="margin:0 0 8px">Excel (.xlsx, .xls) or CSV, up to 5 MB and 20,000 rows. The app finds the phone-number column for you. You check the preview before anything is saved. Landlines, repeats and numbers that are not 10-digit Indian mobiles are skipped.</p><div class="drop"><input type="file" id="uf" accept=".xlsx,.xls,.csv"> <a href="#" id="tpl" class="small">Download a sample file</a></div><div id="up"></div></div>
+      <div class="card"><h2>Recent uploads</h2><div id="blist" class="mut small">Loading…</div></div>
       <div class="card"><h2>All numbers <span class="mut small">(${j.counts.total || 0} total · ${j.counts.unassigned || 0} unassigned)</span></h2>
       <div class="row"><input id="nq" placeholder="Search" value="${esc(numQ.q)}" class="grow" style="min-width:140px"><select id="na"><option value="">Everyone</option><option value="none" ${numQ.assigned === 'none' ? 'selected' : ''}>Unassigned</option>${callersCache.map(c => `<option value="${c.id}" ${numQ.assigned === c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select>
       <select id="ns"><option value="">Any status</option>${['new', ...Object.keys(OUT)].map(s => `<option value="${s}" ${numQ.status === s ? 'selected' : ''}>${s === 'new' ? 'Not called' : OUT[s]}</option>`).join('')}</select><button class="btn sec" id="ngo">Filter</button></div>
@@ -433,29 +434,122 @@
     $('#bun').onclick = () => act({ ids: sel(), user_id: null }, '# numbers unassigned');
     $('#bdel').onclick = () => { const s = sel(); if (s.length && confirm(`Delete ${s.length} number(s)? Call history stays.`)) act({ ids: s, del: true }, '# numbers deleted'); };
     $('#tpl').onclick = e => { e.preventDefault(); exportX('rs-calling-sample-numbers', [{ name: 'Numbers', rows: [['Name', 'Phone', 'Area', 'Notes'], ['Sample Client One', '9876500001', 'Lanka', 'Shop owner'], ['Sample Client Two', '+91 98765 00002', 'Sigra', '']] }]); };
-    $('#uf').onchange = async e => {
-      const f = e.target.files[0]; if (!f) return; const up = $('#up'); up.innerHTML = '<p class="mut">Reading file…</p>';
+    wireUpload();
+  };
+
+  // ---- v1.2: Excel / CSV upload with a preview, import batches and undo ----
+  let upBanner = null;
+  async function wireUpload() {
+    if (upBanner) { $('#up').innerHTML = upBanner; upBanner = null; }
+    let st = null;
+    const showBatches = async () => {
+      const el = $('#blist'); if (!el) return;
       try {
-        const wb = XLSX.read(await f.arrayBuffer(), { type: 'array', raw: false }); const ws = wb.Sheets[wb.SheetNames[0]]; const rows = XLSX.utils.sheet_to_json(ws, { defval: '', raw: false });
-        if (!rows.length) throw new Error('The first sheet is empty'); const cols = Object.keys(rows[0]);
-        up.innerHTML = `<h3>${esc(f.name)} — ${rows.length} rows · columns: ${cols.map(esc).join(', ')}</h3><div class="tw"><table><tr>${cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr>${rows.slice(0, 5).map(r => `<tr>${cols.map(c => `<td>${esc(r[c])}</td>`).join('')}</tr>`).join('')}</table></div>
-          <label class="f">After upload</label><select id="uas"><option value="none">Keep unassigned (assign later)</option><option value="rr">Share equally between all active callers</option>${callersCache.filter(c => c.active).map(c => `<option value="u:${c.id}">Give all to ${esc(c.name)}</option>`).join('')}</select>
-          <div class="row" style="margin-top:10px"><button class="btn" id="ugo">Upload ${rows.length} rows</button></div><div id="ures"></div>`;
-        $('#ugo').onclick = async () => {
-          $('#ugo').disabled = true; const v = $('#uas').value; const tot = { total: 0, added: 0, dup_in_file: 0, dup_existing: 0, invalid: 0, assigned: 0, invalid_rows: [] }; const batch = f.name + ' ' + new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-          try {
-            for (let i = 0; i < rows.length; i += 2000) {
-              $('#ures').innerHTML = `<p class="mut">Uploading ${Math.min(i + 2000, rows.length)} / ${rows.length}…</p>`;
-              const r = await api('contacts_import', { rows: rows.slice(i, i + 2000), batch, assign: v === 'none' ? 'none' : v === 'rr' ? 'rr' : 'user', user_id: v.startsWith('u:') ? v.slice(2) : undefined });
-              for (const k of ['total', 'added', 'dup_existing', 'invalid', 'assigned']) tot[k] += r.report[k]; tot.dup_in_file += r.report.dup_in_file; tot.invalid_rows.push(...r.report.invalid_rows.map(x => x + i));
-            }
-            up.innerHTML = `<div class="banner" style="background:var(--okbg);color:var(--ok)"><b>Upload done:</b> ${tot.added} new numbers added${tot.assigned ? `, ${tot.assigned} assigned` : ''}. Skipped: ${tot.dup_in_file} duplicate in file, ${tot.dup_existing} already in the list, ${tot.invalid} without a valid 10-digit phone${tot.invalid_rows.length ? ` (rows ${tot.invalid_rows.slice(0, 15).join(', ')}${tot.invalid > 15 ? '…' : ''})` : ''}.</div>`;
-            setTimeout(() => { if (view === 'numbers') { const keep = up.innerHTML; renderAdmin('numbers').then(() => { const u = $('#up'); if (u) u.innerHTML = keep; }); } }, 200);
-          } catch (er) { $('#ures').innerHTML = `<p class="err">${esc(er.message)}</p>`; $('#ugo').disabled = false; }
-        };
+        const j = await api('import_list');
+        if (!j.batches.length) { el.innerHTML = 'No uploads yet.'; return; }
+        el.innerHTML = `<div class="tw"><table><tr><th>When (IST)</th><th>File</th><th>Added</th><th>Assigned</th><th>Skipped</th><th>Status</th><th></th></tr>${j.batches.map(b => `<tr><td>${fmtT(b.created_at)}</td><td>${esc(b.file_name)}</td><td>${b.added}</td><td>${b.assigned}</td><td>${b.dup_existing + b.invalid}</td><td>${b.status === 'undone' ? '<span class="tag mut">Undone</span>' : b.status === 'importing' ? '<span class="tag">Unfinished</span>' : 'Imported'}</td><td>${b.status === 'undone' ? '' : b.can_undo ? `<button class="btn sm red" data-undo="${esc(b.id)}">Undo</button>` : `<span class="small mut">${b.called} called, can't undo</span>`}</td></tr>`).join('')}</table></div><p class="small mut">Undo removes only that upload's numbers, and only while none of them has been called.</p>`;
+        $$('[data-undo]', el).forEach(btn => btn.onclick = async () => {
+          const bt = j.batches.find(x => x.id === btn.dataset.undo); if (!bt) return;
+          if (!confirm(`Undo the upload "${bt.file_name}"? Its ${bt.still_here} number(s) will be removed.`)) return;
+          try { const r = await api('import_undo', { import_id: bt.id }); toast(`Upload undone: ${r.removed} numbers removed`); renderAdmin('numbers'); } catch (e) { toast(e.message); }
+        });
+      } catch (e) { el.innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+    };
+    const checkExisting = async () => {
+      if (!st) return; const tok = ++st.token; st.existing = null; updCounts();
+      const phones = st.res.candidates.map(c => c.phone); let ex = 0;
+      try {
+        for (let i = 0; i < phones.length; i += 2000) { const r = await api('import_check', { phones: phones.slice(i, i + 2000) }); if (!st || tok !== st.token) return; ex += r.existing; }
+        if (st && tok === st.token) { st.existing = ex; updCounts(); }
+      } catch (e) { if (st && tok === st.token) { $('#cEx').textContent = '?'; toast(e.message); } }
+    };
+    const updCounts = () => {
+      if (!st || !$('#cNew')) return; const n = st.res.counts.unique_valid;
+      $('#cEx').textContent = st.existing == null ? '…' : st.existing;
+      const fresh = st.existing == null ? null : Math.max(0, n - st.existing);
+      $('#cNew').textContent = fresh == null ? '…' : fresh;
+      const g = $('#ugo'); if (g) { g.textContent = fresh == null ? 'Checking…' : `Import ${fresh} new number${fresh === 1 ? '' : 's'}`; g.disabled = fresh == null || fresh === 0; }
+    };
+    const onMap = () => {
+      const sheetEl = $('#usheet'); const sh = sheetEl ? sheetEl.value : st.book.chosen;
+      const v = id => { const x = $('#' + id).value; return x === '' ? null : Number(x); };
+      st.over = sh !== st.book.chosen ? { sheet: sh } : { sheet: sh, phone: v('mp'), name: v('mn'), area: v('ma'), source: v('ms'), notes: v('mo'), others: $('#mx').checked };
+      st.book = RSI.analyseBook(st.sheets, st.over); st.res = st.book.result;
+      drawPreview(); checkExisting();
+    };
+    const drawPreview = () => {
+      const r = st.res, c = r.counts, m = r.mapping, lb = r.labels;
+      const skipped = Object.entries(c.skipped_by_reason).filter(([k]) => k !== 'duplicate_in_file').reduce((a, [, v]) => a + v, 0);
+      const opt = cur => `<option value="">(none)</option>` + lb.map((l, i) => `<option value="${i}" ${cur === i ? 'selected' : ''}>${esc(l)}</option>`).join('');
+      const sheetSel = st.sheets.length > 1 ? `<label class="f">Sheet</label><select id="usheet">${st.sheets.map(s => `<option value="${esc(s.name)}" ${s.name === st.book.chosen ? 'selected' : ''}>${esc(s.name)} (${st.book.sheets.find(x => x.name === s.name).unique_valid} numbers)</option>`).join('')}</select>` : '';
+      const reasons = Object.entries(c.skipped_by_reason).map(([k, v]) => `${v} ${esc(RSI.reasonText(k).toLowerCase())}`).join(', ');
+      $('#up').innerHTML = `
+        <h3 style="margin:10px 0 2px">${esc(st.name)}</h3>
+        <p class="small mut" style="margin:0 0 8px">${r.header >= 0 ? `Column names taken from row ${r.headerLabel}.` : 'No column names found: the columns are read by their letters.'} Change a column below if the app picked the wrong one.</p>
+        ${sheetSel}
+        <div class="mapgrid">
+          <div><label class="f">Phone number column</label><select id="mp">${opt(m.phone)}</select></div>
+          <div><label class="f">Name column</label><select id="mn">${opt(m.name)}</select></div>
+          <div><label class="f">Address / area column</label><select id="ma">${opt(m.area)}</select></div>
+          <div><label class="f">Source / category column</label><select id="ms">${opt(m.source)}</select></div>
+          <div><label class="f">Notes column</label><select id="mo">${opt(m.notes)}</select></div>
+        </div>
+        <label class="small" style="display:block;margin:8px 0"><input type="checkbox" id="mx" ${m.others && m.others.length ? 'checked' : ''}> Also take numbers from the other phone-number columns</label>
+        <div class="mapgrid" style="margin:8px 0">
+          <div class="stat"><b>${c.rows_read}</b><span>rows read</span></div>
+          <div class="stat"><b>${c.unique_valid}</b><span>valid numbers</span></div>
+          <div class="stat"><b>${c.dup_in_file}</b><span>repeated in the file</span></div>
+          <div class="stat"><b id="cEx">…</b><span>already in your list</span></div>
+          <div class="stat"><b id="cNew">…</b><span>new to import</span></div>
+          <div class="stat"><b>${skipped}</b><span>skipped</span></div>
+        </div>
+        ${skipped ? `<p class="small">${reasons}. <a href="#" id="skipcsv">Download the skipped rows</a>${r.skipped.length >= 5000 ? ' (first 5,000 shown)' : ''}</p>` : '<p class="small mut">Nothing skipped.</p>'}
+        <div class="tw"><table><tr><th>Row</th><th>Name</th><th>Phone</th><th>Address</th><th>Source</th></tr>${r.candidates.slice(0, 20).map(x => `<tr><td>${x.row}</td><td>${esc(x.name)}</td><td>${esc(x.phone)}</td><td class="small">${esc(x.area)}</td><td class="small">${esc(x.source)}</td></tr>`).join('') || '<tr><td colspan="5" class="mut">No numbers to show</td></tr>'}</table></div>
+        <p class="small mut">First ${Math.min(20, r.candidates.length)} of ${r.candidates.length} numbers.</p>
+        <label class="f">After upload</label><select id="uas"><option value="none">Keep unassigned (assign later)</option><option value="rr">Share equally between all active callers</option>${callersCache.filter(x => x.active).map(x => `<option value="u:${x.id}">Give all to ${esc(x.name)}</option>`).join('')}</select>
+        <div class="row" style="margin-top:10px"><button class="btn" id="ugo" disabled>Checking…</button><button class="btn sec" id="ucancel">Cancel</button></div><div id="ures"></div>`;
+      ['mp', 'mn', 'ma', 'ms', 'mo', 'mx', 'usheet'].forEach(id => { const el = $('#' + id); if (el) el.onchange = onMap; });
+      if (skipped) $('#skipcsv').onclick = e => { e.preventDefault(); saveText('upload-skipped-rows.csv', RSI.skippedCsv(r), 'text/csv'); };
+      $('#ucancel').onclick = () => { st = null; $('#up').innerHTML = ''; $('#uf').value = ''; };
+      updCounts();
+      $('#ugo').onclick = async () => {
+        const cur = st; if (!cur) return; const btn = $('#ugo'); btn.disabled = true;
+        const v = $('#uas').value; const assign = v === 'none' ? 'none' : v === 'rr' ? 'rr' : 'user';
+        const cands = cur.res.candidates; const rc = cur.res.counts; const skippedN = Object.entries(rc.skipped_by_reason).filter(([k]) => k !== 'duplicate_in_file').reduce((a, [, x]) => a + x, 0);
+        let imp = null; const tot = { added: 0, dup_existing: 0, invalid: 0, assigned: 0 };
+        try {
+          imp = await api('import_start', { file_name: cur.name, assign, user_id: v.startsWith('u:') ? v.slice(2) : undefined, sheet: cur.book.chosen, mapping: JSON.stringify(cur.res.mapping), rows_read: rc.rows_read, numbers_found: rc.unique_valid, invalid: skippedN, dup_in_file: rc.dup_in_file });
+          for (let i = 0; i < cands.length; i += 2000) {
+            $('#ures').innerHTML = `<p class="mut">Importing ${Math.min(i + 2000, cands.length)} / ${cands.length}…</p>`;
+            const rr = await api('import_chunk', { import_id: imp.import_id, rows: cands.slice(i, i + 2000) });
+            for (const k of Object.keys(tot)) tot[k] += rr[k];
+          }
+          await api('import_finish', { import_id: imp.import_id });
+        } catch (e) {
+          $('#ures').innerHTML = `<p class="err">The upload stopped: ${esc(e.message)}. ${imp ? 'The numbers added so far are listed under Recent uploads, where you can undo them.' : 'Nothing was added.'}</p>`; btn.disabled = false; return;
+        }
+        upBanner = `<div class="banner" style="background:var(--okbg);color:var(--ok)"><b>Upload done:</b> ${tot.added} new numbers added${tot.assigned ? `, ${tot.assigned} assigned` : ''}. Skipped: ${rc.dup_in_file} repeated in the file, ${tot.dup_existing} already in your list, ${skippedN} landline, invalid or without a number. Undo is under Recent uploads.</div>`;
+        st = null; renderAdmin('numbers');
+      };
+    };
+    $('#uf').onchange = async e => {
+      const f = e.target.files[0]; if (!f) return; const up = $('#up');
+      if (!window.RSI || !window.XLSX) { up.innerHTML = '<p class="err">The file reader did not load. Reload the page and try again.</p>'; return; }
+      if (f.size > RSI.MAX_BYTES) { up.innerHTML = `<p class="err">This file is ${(f.size / 1048576).toFixed(1)} MB. The limit is 5 MB. Save a smaller file with just the lead columns and try again.</p>`; return; }
+      up.innerHTML = '<p class="mut">Reading file…</p>';
+      try {
+        await callers();
+        const sheets = RSI.readSheets(XLSX, await f.arrayBuffer());
+        if (!sheets.length) throw new Error('the file has no sheets');
+        const book = RSI.analyseBook(sheets, {});
+        if (book.result.tooManyRows) { up.innerHTML = `<p class="err">This file has more than ${RSI.MAX_ROWS.toLocaleString('en-IN')} rows. Split it into smaller files and upload them one by one.</p>`; return; }
+        if (!book.result.candidates.length) { up.innerHTML = `<p class="err">No phone numbers found in ${esc(f.name)}. The app looks for 10-digit Indian mobile numbers, such as 98765 43210, +91 98765 43210 or 098765 43210. Check that the numbers are in a column and try again.</p>`; return; }
+        st = { name: f.name, sheets, book, res: book.result, over: { sheet: book.chosen }, existing: null, token: 0 };
+        drawPreview(); checkExisting();
       } catch (er) { up.innerHTML = `<p class="err">Could not read the file: ${esc(er.message)}</p>`; }
     };
-  };
+    showBatches();
+  }
 
   const genPw = () => { const a = 'abcdefghjkmnpqrstuvwxyz23456789'; const b = new Uint8Array(8); crypto.getRandomValues(b); return [...b].map(x => a[x % a.length]).join(''); };
   ADMIN.callers = async (main) => {

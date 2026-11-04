@@ -45,6 +45,15 @@ The signing key and admin password are kept outside this repository.
 Apps that read the call log need Google's special permission approval (Call log permission declaration), so the APK is shared
 by link from the website instead of the Play Store.
 
+## v1.2.0 (4 Nov 2026)
+- **Upload client numbers from any Excel or CSV file** (.xlsx, .xls, .csv; up to 5 MB and 20,000 rows). The app reads the file in the browser, finds the header row and the phone-number column(s) by header words and by cell content, and normalises Indian mobile numbers (+91, 0 prefix, spaces, dashes, numbers stored as numbers or in scientific form, several numbers in one cell).
+- **Preview before anything is saved:** rows read, valid numbers, repeats inside the file, already in the list, new to import, skipped rows (with a downloadable CSV: row, reason, value, name). Column choices (phone, name, address, source, notes), the sheet and the other phone columns can be changed on the preview.
+- **After upload:** keep unassigned, share equally between active callers, or give all to one caller. Name, address, source and notes are kept with each number.
+- **Recent uploads and undo:** each upload is recorded; it can be undone while none of its numbers has been called (a called number blocks the undo).
+- Existing counting, anti-fraud and payout rules are unchanged. Help knows about uploads.
+
+Tests: `node --test test/rules.test.mjs test/rules11.test.mjs test/help.test.mjs test/importer.test.mjs` (unit; the importer test reads the real lead workbooks only when `RSC_LEAD_FILES` points at a folder), `test/api12.test.mjs` (API, local worker), `test/pw_v12.py` (Playwright at 390x844 with real .xlsx files).
+
 ## v1.1.0 (4 Nov 2026)
 - **Caller account** screen with wallet (earned / approved / pending / withdrawn / available), username, payment details (UPI or bank, validated, shown masked).
 - **Withdrawals**: balance reserved while pending, 16-hour payout deadline (admin-editable), admin queue with overdue highlight, UPI QR + `upi://` link, mark paid (UTR) / reject (reason), Excel export. The app does not move money — the admin pays in their own UPI app.

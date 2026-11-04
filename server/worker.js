@@ -28,10 +28,12 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS terms (version INTEGER PRIMARY KEY, body TEXT NOT NULL, created_at INTEGER, created_by TEXT)`,
   `CREATE TABLE IF NOT EXISTS terms_accept (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, version INTEGER NOT NULL, accepted_at INTEGER, device TEXT)`,
   `CREATE TABLE IF NOT EXISTS snapshots (day TEXT PRIMARY KEY, csv TEXT, n INTEGER, created_at INTEGER)`,
+  `CREATE TABLE IF NOT EXISTS import_batches (id TEXT PRIMARY KEY, file_name TEXT, status TEXT NOT NULL, created_at INTEGER, created_by TEXT, finished_at INTEGER, undone_at INTEGER, assign_mode TEXT, assign_user_id TEXT, assign_callers TEXT, sheet TEXT, mapping TEXT, rows_read INTEGER DEFAULT 0, numbers_found INTEGER DEFAULT 0, added INTEGER DEFAULT 0, dup_in_file INTEGER DEFAULT 0, dup_existing INTEGER DEFAULT 0, invalid INTEGER DEFAULT 0, assigned INTEGER DEFAULT 0)`,
 ];
 // columns added after v1.0 (added only when missing, so an existing database upgrades in place and keeps its data)
 const NEW_COLS = [['users', 'terms_version', 'INTEGER'], ['users', 'terms_at', 'INTEGER'], ['adjustments', 'akey', 'TEXT'],
-  ['contacts', 'cb_count', 'INTEGER DEFAULT 0'], ['contacts', 'cb_last_at', 'INTEGER'], ['contacts', 'cb_last_dur', 'INTEGER']];
+  ['contacts', 'cb_count', 'INTEGER DEFAULT 0'], ['contacts', 'cb_last_at', 'INTEGER'], ['contacts', 'cb_last_dur', 'INTEGER'],
+  ['contacts', 'import_id', 'TEXT'], ['contacts', 'source', 'TEXT']];
 
 let ready = null;
 async function init(db) {
@@ -42,6 +44,7 @@ async function init(db) {
       if (!cols.some(x => x.name === c)) await db.prepare(`ALTER TABLE ${t} ADD COLUMN ${c} ${d}`).run();
     }
     await db.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS adj_akey ON adjustments(akey) WHERE akey IS NOT NULL`).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS contacts_import ON contacts(import_id)`).run();
     await db.prepare(`INSERT OR IGNORE INTO terms (version, body, created_at, created_by) VALUES (1, ?, ?, 'system')`).bind(R.TERMS_V1, Date.UTC(2026, 10, 4, 0, 0, 0) - 330 * 60000).run();
     if (ADMIN_BOOT && ADMIN_BOOT.username) {
       const has = await db.prepare(`SELECT id FROM users WHERE role='admin' LIMIT 1`).first();
@@ -404,11 +407,84 @@ A.contacts_import = async (db, u, b) => {
   await chunked(st, 80, x => db.batch(x).then(() => []));
   report.assigned = owner.size; await audit(db, u, 'contacts_import', { batch, ...report, invalid_rows: undefined }); return { report };
 };
+// ---- v1.2: upload preview, import batches and undo ----
+const MOBILE_RE = /^[6-9]\d{9}$/;
+const mobileOf = raw => { let d = String(raw == null ? '' : raw).replace(/\D/g, ''); if (d.length === 12 && d.startsWith('91')) d = d.slice(2); else if (d.length === 11 && d.startsWith('0')) d = d.slice(1); return MOBILE_RE.test(d) ? d : ''; };
+async function importSummary(db, id) {
+  const b = await db.prepare(`SELECT * FROM import_batches WHERE id=?`).bind(id).first(); if (!b) return null;
+  const n = await db.prepare(`SELECT COUNT(*) n, SUM(CASE WHEN c.status!='new' OR c.last_call_at IS NOT NULL OR c.lead_state IS NOT NULL OR c.followup_at IS NOT NULL OR c.callback_at IS NOT NULL OR COALESCE(c.cb_count,0)>0 OR EXISTS(SELECT 1 FROM calls x WHERE x.contact_id=c.id) OR EXISTS(SELECT 1 FROM callbacks y WHERE y.contact_id=c.id) THEN 1 ELSE 0 END) called FROM contacts c WHERE c.import_id=?`).bind(id).first();
+  const called = n.called || 0;
+  return { ...b, still_here: n.n || 0, called, can_undo: b.status !== 'undone' && called === 0 };
+}
+A.import_start = async (db, u, b) => {
+  const assign = ['none', 'rr', 'user'].includes(b.assign) ? b.assign : 'none';
+  let callerIds = [];
+  if (assign === 'rr') {
+    callerIds = (await db.prepare(`SELECT id FROM users WHERE role='caller' AND active=1 ORDER BY name`).all()).results.map(r => r.id)
+      .filter(id => !Array.isArray(b.caller_ids) || !b.caller_ids.length || b.caller_ids.includes(id));
+    if (!callerIds.length) bad('No active callers to share the numbers between — add a caller first');
+  }
+  if (assign === 'user' && !(await db.prepare(`SELECT id FROM users WHERE id=? AND role='caller'`).bind(str(b.user_id, 40)).first())) bad('Choose a caller');
+  const id = uid(); const now = Date.now();
+  await db.prepare(`INSERT INTO import_batches (id, file_name, status, created_at, created_by, assign_mode, assign_user_id, assign_callers, sheet, mapping, rows_read, numbers_found, invalid, dup_in_file, added, dup_existing, assigned) VALUES (?, ?, 'importing', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0)`)
+    .bind(id, str(b.file_name, 160) || 'upload', now, str(u.name || u.username, 80), assign, assign === 'user' ? str(b.user_id, 40) : null, assign === 'rr' ? JSON.stringify(callerIds) : null,
+      str(b.sheet, 60), str(b.mapping, 400), int(b.rows_read, 0), int(b.numbers_found, 0), int(b.invalid, 0), int(b.dup_in_file, 0)).run();
+  await audit(db, u, 'import_start', { import_id: id, file_name: str(b.file_name, 160), assign, callers: callerIds.length });
+  return { import_id: id, callers: callerIds.length };
+};
+A.import_chunk = async (db, u, b) => {
+  const batch = await db.prepare(`SELECT * FROM import_batches WHERE id=?`).bind(str(b.import_id, 40)).first();
+  if (!batch) bad('Upload not found'); if (batch.status !== 'importing') bad('This upload is already finished');
+  const rows = Array.isArray(b.rows) ? b.rows.slice(0, 2000) : [];
+  const existing = new Set((await db.prepare(`SELECT phone FROM contacts`).all()).results.map(r => r.phone));
+  const callerIds = batch.assign_mode === 'rr' ? JSON.parse(batch.assign_callers || '[]') : [];
+  const now = Date.now(); let added = 0, dupEx = 0, inv = 0, assigned = 0; const st = []; let idx = batch.added || 0;
+  for (const x of rows) {
+    const phone = mobileOf(x && x.phone);
+    if (!phone) { inv++; continue; }
+    if (existing.has(phone)) { dupEx++; continue; }
+    existing.add(phone);
+    const owner = batch.assign_mode === 'rr' ? (callerIds[idx % callerIds.length] || null) : batch.assign_mode === 'user' ? batch.assign_user_id : null;
+    idx++; added++; if (owner) assigned++;
+    st.push(db.prepare(`INSERT OR IGNORE INTO contacts (id, phone, name, area, notes, source, assigned_to, assigned_at, status, batch, import_id, created_at) VALUES (?,?,?,?,?,?,?,?, 'new', ?, ?, ?)`)
+      .bind(uid(), phone, str(x.name, 120), str(x.area, 120), str(x.notes, 500), str(x.source, 120), owner, owner ? now : null, str(batch.file_name, 80), batch.id, now));
+  }
+  await chunked(st, 80, x => db.batch(x).then(() => []));
+  await db.prepare(`UPDATE import_batches SET added=added+?, dup_existing=dup_existing+?, invalid=invalid+?, assigned=assigned+? WHERE id=?`).bind(added, dupEx, inv, assigned, batch.id).run();
+  return { added, dup_existing: dupEx, invalid: inv, assigned };
+};
+A.import_finish = async (db, u, b) => {
+  const id = str(b.import_id, 40); const s = await importSummary(db, id); if (!s) bad('Upload not found');
+  if (s.status === 'importing') await db.prepare(`UPDATE import_batches SET status='done', finished_at=? WHERE id=?`).bind(Date.now(), id).run();
+  const f = await importSummary(db, id);
+  await audit(db, u, 'import_done', { import_id: id, file_name: f.file_name, added: f.added, dup_existing: f.dup_existing, invalid: f.invalid, assigned: f.assigned, assign: f.assign_mode });
+  return { batch: f };
+};
+A.import_check = async (db, u, b) => {
+  const ph = [...new Set((Array.isArray(b.phones) ? b.phones.slice(0, 2000) : []).map(mobileOf).filter(Boolean))];
+  const have = new Set((await db.prepare(`SELECT phone FROM contacts`).all()).results.map(r => r.phone));
+  return { checked: ph.length, existing: ph.filter(p => have.has(p)).length };
+};
+A.import_list = async (db) => {
+  const ids = (await db.prepare(`SELECT id FROM import_batches ORDER BY created_at DESC LIMIT 30`).all()).results.map(r => r.id);
+  const out = []; for (const id of ids) out.push(await importSummary(db, id));
+  return { batches: out };
+};
+A.import_undo = async (db, u, b) => {
+  const id = str(b.import_id, 40); const s = await importSummary(db, id); if (!s) bad('Upload not found');
+  if (s.status === 'undone') bad('This upload was already undone');
+  if (s.called > 0) bad(`${s.called} of these numbers ${s.called === 1 ? 'has' : 'have'} already been called, so this upload cannot be undone. Only uploads with no calls can be undone.`);
+  await db.prepare(`DELETE FROM contacts WHERE import_id=?`).bind(id).run();
+  await db.prepare(`UPDATE import_batches SET status='undone', undone_at=? WHERE id=?`).bind(Date.now(), id).run();
+  await audit(db, u, 'import_undo', { import_id: id, file_name: s.file_name, removed: s.still_here });
+  return { removed: s.still_here };
+};
 A.contacts_list = async (db, u, b) => {
   const w = []; const p = [];
   if (b.q) { w.push(`(c.name LIKE ? OR c.phone LIKE ? OR c.area LIKE ?)`); const q = '%' + str(b.q, 60) + '%'; p.push(q, q, q); }
   if (b.assigned === 'none') w.push(`c.assigned_to IS NULL`); else if (b.assigned) { w.push(`c.assigned_to = ?`); p.push(b.assigned); }
   if (b.status) { w.push(`c.status = ?`); p.push(b.status); }
+  if (b.import_id) { w.push(`c.import_id = ?`); p.push(str(b.import_id, 40)); }
   const where = w.length ? 'WHERE ' + w.join(' AND ') : ''; const lim = Math.min(500, int(b.limit, 200)); const off = Math.max(0, int(b.offset, 0));
   const total = (await db.prepare(`SELECT COUNT(*) n FROM contacts c ${where}`).bind(...p).first()).n;
   const rows = (await db.prepare(`SELECT c.*, u.name caller_name FROM contacts c LEFT JOIN users u ON u.id=c.assigned_to ${where} ORDER BY c.created_at DESC, c.name LIMIT ${lim} OFFSET ${off}`).bind(...p).all()).results;

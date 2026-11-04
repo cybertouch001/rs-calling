@@ -61,6 +61,7 @@
     gone: ['gone', 'go', 'went', 'lost', 'missing', 'gayab', 'where', 'kaha', 'kahan', 'disappeared', 'vanished'],
     callback: ['callback', 'callbacks', 'wapas', 'returned', 'return', 'returns', 'calledback', 'phir'],
     terms: ['terms', 'conditions', 'condition', 'tnc', 'policy', 'agreement', 'rules', 'niyam', 'sharte', 'shart'],
+    upload: ['upload', 'uploads', 'uploaded', 'import', 'importing', 'excel', 'xlsx', 'xls', 'csv', 'sheet', 'spreadsheet', 'bulk', 'undo'],
     offline: ['offline', 'internet', 'network', 'net', 'wifi', 'sync', 'syncing', 'synced', 'upload', 'uploaded', 'signal', 'connection'],
     perm: ['permission', 'permissions', 'allow', 'access', 'denied', 'ijazat'],
     rec: ['record', 'recording', 'recorded', 'recorder', 'audio', 'listen', 'voice', 'awaaz'],
@@ -102,10 +103,11 @@
     { id: 'dialer', score: t => (has(t, 'dialer') ? 3 : 0) + (has(t, 'call') ? 1 : 0), a: () => 'Only calls made with the green call button in this app are counted. Calls from the normal dialer, WhatsApp or other apps are not counted.' },
     { id: 'login', score: t => has(t, 'login') ? 3 : 0, a: () => 'Change your password under Account → Change password. If you forgot it or your account is locked or deactivated, ask your admin to reset it. Do not share your login — one account per person.' },
     { id: 'result', score: t => (has(t, 'result') ? 2 : 0) + (has(t, 'call') ? 1 : 0), a: () => 'After every call choose the result: Interested, Not interested, Callback (pick a date and time), Wrong number or Not reachable, and add a note if you want. You must save a result so the call syncs.' },
+    { id: 'upload', score: t => (has(t, 'upload') ? 3 : 0), a: () => 'Admins add client numbers from Numbers → Upload client numbers. Pick an Excel (.xlsx, .xls) or CSV file up to 5 MB. The app finds the phone-number column, shows a preview (how many are new, already in the list, repeated or skipped), and only then imports. Landlines and numbers that are not 10-digit mobiles are skipped and can be downloaded as a list. An upload can be undone while none of its numbers has been called. You only see the numbers assigned to you.' },
     { id: 'admin', score: t => (has(t, 'admin') ? 2 : 0), a: () => 'For account problems, wrong counting, missing payments or any change, please contact your admin directly. I can only explain how the app works.' },
   ];
   const REFUSE = 'I can only help with using this app. You can ask me about: how calls are counted, why a call was not counted, withdrawing money, payment details, your streak, call logs, callbacks, offline use or the Terms.';
-  const TOPICS = ['How are my calls counted?', 'Why was my call not counted?', 'How do I withdraw money?', 'How does the streak work?', 'Why are my old logs gone?', 'What is a callback?'];
+  const TOPICS = ['How are my calls counted?', 'Why was my call not counted?', 'How do I withdraw money?', 'How does the streak work?', 'Why are my old logs gone?', 'What is a callback?', 'How do I upload client numbers from Excel?'];
   function helpAnswer(question, settings) {
     const s = { min_duration: 30, repeat_hours: 24, call_rate: 0, lead_rate: 0, retention_days: 7, min_withdrawal: 100, withdraw_hours: 16, daily_target: 10, streak_bonus_7: 0, streak_bonus_30: 0, callback_counts: 0, ...(settings || {}) };
     const t = tokens(question); if (!t.length) return { matched: false, topic: null, answer: REFUSE, suggestions: TOPICS };
