@@ -361,12 +361,28 @@
     if (filt === 'callback') xs = xs.filter(c => c.status === 'callback').sort((a, b) => (a.callback_at || 0) - (b.callback_at || 0));
     if (filt === 'back') xs = xs.filter(c => c.cb_last_at).sort((a, b) => b.cb_last_at - a.cb_last_at);
     if (filt === 'done') xs = xs.filter(c => c.status !== 'new' && c.status !== 'callback');
-    el.innerHTML = xs.slice(0, 400).map(c => `<div class="ci"><div class="grow"><div class="nm">${esc(c.name || 'Client')}</div><div class="ph">${esc(c.phone)}${c.area ? ' · ' + esc(c.area) : ''}</div>
+    el.innerHTML = xs.slice(0, 400).map(c => `<div class="ci"><div class="grow"><div class="nm">${esc(c.name || 'Client')}</div><div class="ph">${esc(c.phone)}${c.area ? ' · ' + esc(c.area) : ''} · <a href="#" class="hlink" data-h="${esc(c.phone)}">History</a></div>
       ${c.status !== 'new' ? `<div class="small"><span class="tag ${c.status === 'interested' ? 'ok' : c.status === 'callback' ? 'warn' : 'mut'}">${esc(OUT[c.status] || c.status)}</span> ${c.status === 'callback' && c.callback_at ? `<span class="${c.callback_at < now ? 'due' : ''}">${c.callback_at < now ? 'Due ' : ''}${fmtT(c.callback_at)}</span>` : c.last_call_at ? '<span class="mut">' + fmtT(c.last_call_at) + '</span>' : ''}</div>` : ''}
       ${c.cb_last_at ? `<div class="small" style="margin-top:3px"><span class="tag ok">Callback received</span> <span class="mut">${fmtT(c.cb_last_at)}${c.cb_last_dur ? ' · ' + fmtD(c.cb_last_dur) : ' · missed'}${c.cb_count > 1 ? ' · ' + c.cb_count + ' times' : ''}</span></div>` : ''}
       ${c.notes ? `<div class="small mut">${esc(c.notes)}</div>` : ''}${c.last_note ? `<div class="small">“${esc(c.last_note)}”</div>` : ''}</div><button class="callb" data-c="${esc(c.id)}" aria-label="Call">${ico('list', 24)}</button></div>`).join('') || (L.length ? empty('inbox', 'Nothing here', 'Try another filter.') : empty('list', 'No numbers assigned yet', 'Ask your admin to assign client numbers to you.'));
     if (xs.length > 400) el.innerHTML += `<p class="mut small">Showing 400 of ${xs.length}. Use search.</p>`;
     $$('[data-c]', el).forEach(b => b.onclick = () => placeCall(L.find(c => c.id === b.dataset.c)));
+    $$('[data-h]', el).forEach(b => b.onclick = e => { e.preventDefault(); e.stopPropagation(); numberSheet(b.dataset.h, false); });
+  }
+
+  // ---- v1.3: one number's history: every attempt and callback in order, with what was paid ----
+  async function numberSheet(phone, admin) {
+    const s = sheet(`<h2 style="margin:0 0 2px">${esc(phone)}</h2><div class="mut small" id="nhb">Loading…</div>`, () => {});
+    try {
+      const j = await api('number_history', { phone }); const b = s.querySelector('#nhb'); const sm = j.summary;
+      const who = j.contact && j.contact.name ? esc(j.contact.name) + (j.contact.area ? ' · ' + esc(j.contact.area) : '') : 'No name on file';
+      const ev = j.events.length ? j.events.map(e => `<div style="border-top:1px solid #e5e7eb;padding:8px 0"><div class="row"><b class="grow">${fmtT(e.at)} · ${e.kind === 'callback' ? 'Client called back' : (admin && e.caller ? esc(e.caller) : 'Your call')}</b><span class="tag ${e.amount ? 'ok' : 'mut'}">${e.amount ? '+' + rs(e.amount) : rs(0)}</span></div>
+        <div class="small">${esc(e.result)}${e.connected ? ' · ' + fmtD(e.duration) : ''}${e.kind === 'call' ? (e.call_paid ? ' · call paid' : ' · no call pay') : ''}${e.lead_paid ? ' · interest lead paid' : ''}${e.callback_paid ? ' · callback paid' : ''}</div>
+        ${e.reason ? `<div class="small mut">${esc(e.reason)}</div>` : ''}${e.note ? `<div class="small">“${esc(e.note)}”</div>` : ''}</div>`).join('') : '<p class="mut small">No calls or callbacks for this number yet.</p>';
+      const up = admin && j.uploads && j.uploads.length ? `<div class="small" style="margin:10px 0 2px"><b>Uploaded ${j.uploads.length} time${j.uploads.length > 1 ? 's' : ''}</b></div>` + j.uploads.map(u => `<div class="small mut">${fmtT(u.at)} · ${esc(u.file_name || '')} · ${({ added: 'new', dup_existing: 'already in the list', dup_in_upload: 'repeated in the same file' })[u.result] || esc(u.result)}${u.by ? ' · by ' + esc(u.by) : ''}</div>`).join('') : '';
+      b.innerHTML = `<div class="small">${who}${admin && j.contact && j.contact.assigned_to ? ' · with ' + esc(j.contact.assigned_to) : ''}</div>
+        <div class="stats" style="margin:10px 0"><div class="stat"><b>${sm.attempts}</b><span>Attempts</span></div><div class="stat"><b>${sm.connected}</b><span>Answered</span></div><div class="stat"><b>${rs(sm.amount)}</b><span>Paid for this number</span></div></div>${ev}${up}`;
+    } catch (e) { const b = s.querySelector('#nhb'); if (b) b.textContent = e.message; }
   }
 
   // ================= ADMIN =================
@@ -416,6 +432,7 @@
     await callers(); const j = await api('contacts_list', { ...numQ, limit: 200 });
     main.innerHTML = `<div class="card" id="upcard"><h2>Upload client numbers</h2><p class="mut small" style="margin:0 0 8px">Excel (.xlsx, .xls) or CSV, up to 5 MB and 20,000 rows. The app finds the phone-number column for you. You check the preview before anything is saved. Landlines, repeats and numbers that are not 10-digit Indian mobiles are skipped.</p><div class="drop"><input type="file" id="uf" accept=".xlsx,.xls,.csv"> <a href="#" id="tpl" class="small">Download a sample file</a></div><div id="up"></div></div>
       <div class="card"><h2>Recent uploads</h2><div id="blist" class="mut small">Loading…</div></div>
+      <div class="card" id="uhist"></div>
       <div class="card"><h2>All numbers <span class="mut small">(${j.counts.total || 0} total · ${j.counts.unassigned || 0} unassigned)</span></h2>
       <div class="row"><input id="nq" placeholder="Search" value="${esc(numQ.q)}" class="grow" style="min-width:140px"><select id="na"><option value="">Everyone</option><option value="none" ${numQ.assigned === 'none' ? 'selected' : ''}>Unassigned</option>${callersCache.map(c => `<option value="${c.id}" ${numQ.assigned === c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select>
       <select id="ns"><option value="">Any status</option>${['new', ...Object.keys(OUT)].map(s => `<option value="${s}" ${numQ.status === s ? 'selected' : ''}>${s === 'new' ? 'Not called' : OUT[s]}</option>`).join('')}</select><button class="btn sec" id="ngo">Filter</button></div>
@@ -434,8 +451,22 @@
     $('#bun').onclick = () => act({ ids: sel(), user_id: null }, '# numbers unassigned');
     $('#bdel').onclick = () => { const s = sel(); if (s.length && confirm(`Delete ${s.length} number(s)? Call history stays.`)) act({ ids: s, del: true }, '# numbers deleted'); };
     $('#tpl').onclick = e => { e.preventDefault(); exportX('rs-calling-sample-numbers', [{ name: 'Numbers', rows: [['Name', 'Phone', 'Area', 'Notes'], ['Sample Client One', '9876500001', 'Lanka', 'Shop owner'], ['Sample Client Two', '+91 98765 00002', 'Sigra', '']] }]); };
-    wireUpload();
+    wireUpload(); loadUploadHistory();
   };
+  // v1.3: every time a number came in (new, already in the list, or repeated in the same file), with who uploaded it
+  let uhQ = { q: '', from: '', to: '' };
+  async function loadUploadHistory() {
+    const el = $('#uhist'); if (!el) return;
+    el.innerHTML = `<h2>Every upload, number by number</h2><p class="mut small" style="margin:0 0 8px">A number uploaded again shows again, with the file and who uploaded it. Tap a number for its calls and payouts.</p>
+      <div class="row"><input id="uq" placeholder="Number" value="${esc(uhQ.q)}" class="grow" style="min-width:120px"><input type="date" id="ufr" value="${esc(uhQ.from)}"><input type="date" id="uto" value="${esc(uhQ.to)}"><button class="btn sec" id="ugo">Filter</button></div><div id="uhl" class="mut small" style="margin-top:8px">Loading…</div>`;
+    $('#ugo').onclick = () => { uhQ = { q: $('#uq').value.trim(), from: $('#ufr').value, to: $('#uto').value }; loadUploadHistory(); };
+    try {
+      const j = await api('uploads_list', uhQ);
+      const RES = { added: 'New', dup_existing: 'Already in the list', dup_in_upload: 'Repeated in same file' };
+      $('#uhl').innerHTML = j.hits.length ? `<div class="tw"><table><tr><th>When (IST)</th><th>Number</th><th>File</th><th>Result</th><th class="n">Times uploaded</th><th>With</th><th>Status</th></tr>${j.hits.map(h => `<tr><td>${fmtT(h.at)}</td><td><a href="#" data-nh="${esc(h.phone)}">${esc(h.phone)}</a></td><td>${esc(h.file_name || '')}${h.by ? '<br><span class="mut">by ' + esc(h.by) + '</span>' : ''}</td><td>${RES[h.result] || esc(h.result)}</td><td class="n">${h.times_uploaded}</td><td>${esc(h.caller_name || 'Not assigned')}</td><td>${esc(OUT[h.status] || (h.status === 'new' ? 'Not called' : h.status || 'Not called'))}${h.lead_state === 'interested' || h.lead_state === 'open' ? ' · lead' : ''}</td></tr>`).join('')}</table></div>${j.hits.length >= j.limit ? `<p class="mut small">Showing the latest ${j.limit}. Narrow the filter to see more.</p>` : ''}` : '<p class="mut small">No uploads match.</p>';
+      $$('[data-nh]', el).forEach(a => a.onclick = e => { e.preventDefault(); numberSheet(a.dataset.nh, true); });
+    } catch (e) { $('#uhl').textContent = e.message; }
+  }
 
   // ---- v1.2: Excel / CSV upload with a preview, import batches and undo ----
   let upBanner = null;
@@ -748,6 +779,33 @@
     catch (e) { if (e.terms) termsGate = true; }          // offline: carry on; the server still checks the Terms on every request
     purgeLocal(); renderCaller('list'); syncNow(true);
   }
+  // v1.3: pull down from the top of any screen to reload it (queued calls go first for callers)
+  function installPullToRefresh() {
+    let y0 = null, dy = 0, busy = false;
+    const bar = document.createElement('div'); bar.id = 'ptr'; bar.innerHTML = '<span></span>';
+    bar.style.cssText = 'position:fixed;left:0;right:0;top:0;height:0;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:13px;color:#fff;background:#0b2545;transition:height .15s;z-index:60';
+    document.body.appendChild(bar);
+    const pageTop = () => (window.scrollY || document.documentElement.scrollTop || 0) <= 0 && !document.querySelector('.sheet');
+    const insideScrolled = t => { for (let n = t; n && n !== document.body; n = n.parentElement) if (n.scrollTop > 0) return true; return false; };
+    document.addEventListener('touchstart', e => { if (busy || !pageTop() || insideScrolled(e.target)) { y0 = null; return; } y0 = e.touches[0].clientY; dy = 0; }, { passive: true });
+    document.addEventListener('touchmove', e => { if (y0 == null) return; dy = Math.max(0, e.touches[0].clientY - y0); bar.style.height = Math.min(48, dy * 0.5) + 'px'; bar.firstChild.textContent = dy > 90 ? 'Release to refresh' : 'Pull to refresh'; }, { passive: true });
+    document.addEventListener('touchend', async () => {
+      if (y0 == null) return; const go = dy > 90 && pageTop(); y0 = null;
+      if (!go) { bar.style.height = '0'; return; }
+      busy = true; bar.style.height = '36px'; bar.firstChild.textContent = 'Refreshing…';
+      try { await refreshCurrent(); } catch (err) { toast(err.message || 'Could not refresh'); }
+      finally { busy = false; bar.style.height = '0'; }
+    });
+  }
+  async function refreshCurrent() {
+    if (!me || !token) return;
+    if (me.role === 'admin') { await renderAdmin(view || 'dash'); return; }
+    if (termsGate) return;
+    await syncNow(true);                                     // queued calls go up first, then the list comes down
+    await loadList().catch(() => {});
+    renderCaller(view || 'list');
+  }
+  installPullToRefresh();
   window.addEventListener('online', () => syncNow(true));
   setInterval(() => syncNow(true), 30000);
   // a second session check every 20 s so a deactivated / logged-out user is sent to the login quickly
