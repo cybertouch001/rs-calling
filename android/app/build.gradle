@@ -9,8 +9,8 @@ android {
         applicationId 'bot.tab.sites.rscalling'
         minSdk 24
         targetSdk 34
-        versionCode 120
-        versionName '1.2.0'
+        versionCode 130
+        versionName '1.3.0'
         buildConfigField 'boolean', 'WEB_DEBUG', (System.getenv('RSC_WEBDEBUG') == '1' ? 'true' : 'false')
         manifestPlaceholders = [cleartext: (System.getenv('RSC_WEBDEBUG') == '1' ? 'true' : 'false')]
         buildConfigField 'String', 'SERVER', '"' + (System.getenv('RSC_SERVER') ?: 'https://rs-calling.sites.tab.bot') + '"'
