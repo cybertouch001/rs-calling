@@ -1,0 +1,29 @@
+R&S Calling v1.3.0 - built 6 Nov 2026 (status: code, tests and APK done; live server publish held, see BLOCKERS)
+
+WHAT CHANGED
+1. Payout rule: an Interested call pays only the interest lead (no per-call rate on top). Stored per call as call_pay; totals use it.
+   Calls that started before the switch-on moment keep their old payouts (nothing before it is re-paid or recomputed).
+2. Callbacks: a number that rang back and was answered earns the per-call rate once (repeat window per number unchanged).
+   A not-answered original call still pays nothing. Callbacks from before the switch-on moment are never back-paid.
+   callback_counts is switched ON by the v1.3 migration (it was 0). The previous value is written to the audit log (v13_migrate).
+3. Same callback recorded twice from a re-sent sync is not recorded twice.
+4. Per-number history: API number_history (caller: own numbers only; admin: all). Shows every attempt and callback in time order,
+   what was paid for each, and (admin) every upload of the number.
+5. Upload history: table upload_hits, one row per number per upload (new / already in the list / repeated in the same file).
+   API uploads_list (filter by number and date). Admin > Numbers shows "Every upload, number by number".
+6. Caller and admin apps: pull down from the top of any screen to reload (queued calls go up first for callers).
+   Caller list: History link under each number. Admin: tap a number for its history.
+7. Migration (automatic on first request after deploy, additive only): new column calls.call_pay, new table upload_hits,
+   backfill of one 'added' hit per existing number, settings v13_since / callback_since / v13_migrated, callback_counts=1.
+   No row is deleted or rewritten, no past payout is recomputed.
+
+TESTS
+- test/v13.rules.test.mjs : 17 unit tests of the payout rules (node test/v13.rules.test.mjs).
+- test/v13.api.test.mjs   : 16 API checks against a running server (BASE=... ADMIN_PW=... node test/v13.api.test.mjs), run against a local worker build.
+- test/v13.ui_smoke.py    : headless browser smoke (caller history sheet, pull-to-refresh gesture, admin upload card), run locally.
+
+ASSUMPTIONS TO CONFIRM WITH ADITYA
+- Interested call with no lead (second interested for the same number, or too short): no call rate either.
+- Callback pays the per-call rate (call_rate) once per number per repeat window, only if answered for at least min_duration.
+- callback_counts switched on by migration.
+- Rules apply to calls from the moment of deploy; earlier calls unchanged.
