@@ -28,12 +28,14 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS terms (version INTEGER PRIMARY KEY, body TEXT NOT NULL, created_at INTEGER, created_by TEXT)`,
   `CREATE TABLE IF NOT EXISTS terms_accept (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, version INTEGER NOT NULL, accepted_at INTEGER, device TEXT)`,
   `CREATE TABLE IF NOT EXISTS snapshots (day TEXT PRIMARY KEY, csv TEXT, n INTEGER, created_at INTEGER)`,
+  `CREATE TABLE IF NOT EXISTS upload_hits (id TEXT PRIMARY KEY, phone TEXT NOT NULL, import_id TEXT, file_name TEXT, result TEXT NOT NULL, at INTEGER, by TEXT)`,
+  `CREATE INDEX IF NOT EXISTS upload_hits_phone ON upload_hits(phone)`,
   `CREATE TABLE IF NOT EXISTS import_batches (id TEXT PRIMARY KEY, file_name TEXT, status TEXT NOT NULL, created_at INTEGER, created_by TEXT, finished_at INTEGER, undone_at INTEGER, assign_mode TEXT, assign_user_id TEXT, assign_callers TEXT, sheet TEXT, mapping TEXT, rows_read INTEGER DEFAULT 0, numbers_found INTEGER DEFAULT 0, added INTEGER DEFAULT 0, dup_in_file INTEGER DEFAULT 0, dup_existing INTEGER DEFAULT 0, invalid INTEGER DEFAULT 0, assigned INTEGER DEFAULT 0)`,
 ];
 // columns added after v1.0 (added only when missing, so an existing database upgrades in place and keeps its data)
 const NEW_COLS = [['users', 'terms_version', 'INTEGER'], ['users', 'terms_at', 'INTEGER'], ['adjustments', 'akey', 'TEXT'],
   ['contacts', 'cb_count', 'INTEGER DEFAULT 0'], ['contacts', 'cb_last_at', 'INTEGER'], ['contacts', 'cb_last_dur', 'INTEGER'],
-  ['contacts', 'import_id', 'TEXT'], ['contacts', 'source', 'TEXT']];
+  ['contacts', 'import_id', 'TEXT'], ['contacts', 'source', 'TEXT'], ['calls', 'call_pay', 'INTEGER']];
 
 let ready = null;
 async function init(db) {
@@ -45,6 +47,19 @@ async function init(db) {
     }
     await db.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS adj_akey ON adjustments(akey) WHERE akey IS NOT NULL`).run();
     await db.prepare(`CREATE INDEX IF NOT EXISTS contacts_import ON contacts(import_id)`).run();
+    if (!(await db.prepare(`SELECT k FROM settings WHERE k='v13_migrated'`).first())) {
+      // v1.3: switch-on moment for the new rules (nothing before it is re-paid or re-computed), callbacks paid from then on,
+      // and one 'added' hit per existing number so the upload history starts from the data already here.
+      const now = Date.now(); const prev = await db.prepare(`SELECT v FROM settings WHERE k='callback_counts'`).first();
+      await db.batch([
+        db.prepare(`INSERT OR IGNORE INTO settings (k, v) VALUES ('v13_since', ?)`).bind(String(now)),
+        db.prepare(`INSERT OR IGNORE INTO settings (k, v) VALUES ('callback_since', ?)`).bind(String(now)),
+        db.prepare(`INSERT INTO settings (k, v) VALUES ('callback_counts', '1') ON CONFLICT(k) DO UPDATE SET v='1'`),
+        db.prepare(`INSERT OR IGNORE INTO upload_hits (id, phone, import_id, file_name, result, at, by) SELECT 'bf' || c.id, c.phone, c.import_id, COALESCE(c.batch, ''), 'added', COALESCE(c.created_at, 0), COALESCE((SELECT b.created_by FROM import_batches b WHERE b.id = c.import_id), '') FROM contacts c`),
+        db.prepare(`INSERT OR IGNORE INTO settings (k, v) VALUES ('v13_migrated', ?)`).bind(String(now)),
+        db.prepare(`INSERT INTO audit (at, user_id, action, detail) VALUES (?, NULL, 'v13_migrate', ?)`).bind(now, JSON.stringify({ callback_counts_before: prev ? prev.v : null, callback_counts_after: 1, v13_since: now }))
+      ]);
+    }
     await db.prepare(`INSERT OR IGNORE INTO terms (version, body, created_at, created_by) VALUES (1, ?, ?, 'system')`).bind(R.TERMS_V1, Date.UTC(2026, 10, 4, 0, 0, 0) - 330 * 60000).run();
     if (ADMIN_BOOT && ADMIN_BOOT.username) {
       const has = await db.prepare(`SELECT id FROM users WHERE role='admin' LIMIT 1`).first();
@@ -123,7 +138,7 @@ async function login(db, b, req) {
 }
 
 // ---------- counting ----------
-const CALL_COLS = `id, user_id, contact_id, phone, log_phone, tapped_at, start_ts, duration, log_found, assigned_ok, outcome, elig_reason, counted, reason, lead_counted, lead_reason, override, lead_override, approval_id`;
+const CALL_COLS = `id, user_id, contact_id, phone, log_phone, tapped_at, start_ts, duration, log_found, assigned_ok, outcome, elig_reason, counted, reason, lead_counted, lead_reason, override, lead_override, approval_id, call_pay`;
 async function recomputeFor(db, synced, s) {
   if (!synced.length) return;
   const updates = []; const phones = new Set(synced.map(c => c.phone).filter(Boolean));
@@ -151,8 +166,9 @@ async function rechainPhones(db, phones, s) {
       const res = R.chainNumber(input, s);
       for (const c of list) {
         if (c.approval_id) continue; const r = res.get(c.id);
-        if ((r.counted ? 1 : 0) !== c.counted || r.reason !== c.reason || (r.lead_counted ? 1 : 0) !== c.lead_counted || r.lead_reason !== c.lead_reason)
-          updates.push(db.prepare(`UPDATE calls SET counted=?, reason=?, lead_counted=?, lead_reason=? WHERE id=?`).bind(r.counted ? 1 : 0, r.reason, r.lead_counted ? 1 : 0, r.lead_reason, c.id));
+        const pay = r.call_pay ? 1 : 0;
+        if ((r.counted ? 1 : 0) !== c.counted || r.reason !== c.reason || (r.lead_counted ? 1 : 0) !== c.lead_counted || r.lead_reason !== c.lead_reason || pay !== (c.call_pay == null ? (c.counted ? 1 : 0) : c.call_pay))
+          updates.push(db.prepare(`UPDATE calls SET counted=?, reason=?, lead_counted=?, lead_reason=?, call_pay=? WHERE id=?`).bind(r.counted ? 1 : 0, r.reason, r.lead_counted ? 1 : 0, r.lead_reason, pay, c.id));
       }
     }
   });
@@ -438,12 +454,13 @@ A.import_chunk = async (db, u, b) => {
   const rows = Array.isArray(b.rows) ? b.rows.slice(0, 2000) : [];
   const existing = new Set((await db.prepare(`SELECT phone FROM contacts`).all()).results.map(r => r.phone));
   const callerIds = batch.assign_mode === 'rr' ? JSON.parse(batch.assign_callers || '[]') : [];
-  const now = Date.now(); let added = 0, dupEx = 0, inv = 0, assigned = 0; const st = []; let idx = batch.added || 0;
+  const now = Date.now(); let added = 0, dupEx = 0, inv = 0, assigned = 0; const st = []; let idx = batch.added || 0; const inThisFile = new Set();
   for (const x of rows) {
     const phone = mobileOf(x && x.phone);
     if (!phone) { inv++; continue; }
-    if (existing.has(phone)) { dupEx++; continue; }
-    existing.add(phone);
+    if (existing.has(phone)) { dupEx++; st.push(db.prepare(`INSERT INTO upload_hits (id, phone, import_id, file_name, result, at, by) VALUES (?,?,?,?,?,?,?)`).bind(uid(), phone, batch.id, str(batch.file_name, 80), inThisFile.has(phone) ? 'dup_in_upload' : 'dup_existing', now, str(batch.created_by, 80))); continue; }
+    existing.add(phone); inThisFile.add(phone);
+    st.push(db.prepare(`INSERT INTO upload_hits (id, phone, import_id, file_name, result, at, by) VALUES (?,?,?,?,?,?,?)`).bind(uid(), phone, batch.id, str(batch.file_name, 80), 'added', now, str(batch.created_by, 80)));
     const owner = batch.assign_mode === 'rr' ? (callerIds[idx % callerIds.length] || null) : batch.assign_mode === 'user' ? batch.assign_user_id : null;
     idx++; added++; if (owner) assigned++;
     st.push(db.prepare(`INSERT OR IGNORE INTO contacts (id, phone, name, area, notes, source, assigned_to, assigned_at, status, batch, import_id, created_at) VALUES (?,?,?,?,?,?,?,?, 'new', ?, ?, ?)`)
@@ -459,6 +476,17 @@ A.import_finish = async (db, u, b) => {
   const f = await importSummary(db, id);
   await audit(db, u, 'import_done', { import_id: id, file_name: f.file_name, added: f.added, dup_existing: f.dup_existing, invalid: f.invalid, assigned: f.assigned, assign: f.assign_mode });
   return { batch: f };
+};
+A.uploads_list = async (db, u, b) => {
+  const s = await getSettings(db); const where = []; const args = [];
+  const q = String(b.q || '').replace(/\D/g, '').slice(-10); if (q) { where.push('h.phone LIKE ?'); args.push('%' + q + '%'); }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(b.from || '')) { where.push('h.at >= ?'); args.push(R.dayStart(b.from, s.tz_offset_min)); }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(b.to || '')) { where.push('h.at < ?'); args.push(R.dayStart(b.to, s.tz_offset_min) + 86400000); }
+  const lim = Math.min(1000, Math.max(1, int(b.limit, 300)));
+  const hits = (await db.prepare(`SELECT h.phone, h.at, h.file_name, h.result, h.by, k.name contact_name, k.area contact_area, k.status, k.lead_state, k.cb_count, k.assigned_to, u.name caller_name FROM upload_hits h LEFT JOIN contacts k ON k.phone = h.phone LEFT JOIN users u ON u.id = k.assigned_to ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY h.at DESC LIMIT ?`).bind(...args, lim).all()).results;
+  const phones = [...new Set(hits.map(h => h.phone))]; const seen = {};
+  await chunked(phones, 200, ps => db.prepare(`SELECT phone, COUNT(*) n, MIN(at) first_at, MAX(at) last_at FROM upload_hits WHERE phone IN (${ps.map(() => '?').join(',')}) GROUP BY phone`).bind(...ps).all().then(r => { for (const x of r.results) seen[x.phone] = x; return []; }));
+  return { hits: hits.map(h => ({ ...h, times_uploaded: seen[h.phone] ? seen[h.phone].n : 1, first_upload: seen[h.phone] ? seen[h.phone].first_at : h.at, last_upload: seen[h.phone] ? seen[h.phone].last_at : h.at })), limit: lim };
 };
 A.import_check = async (db, u, b) => {
   const ph = [...new Set((Array.isArray(b.phones) ? b.phones.slice(0, 2000) : []).map(mobileOf).filter(Boolean))];
@@ -639,6 +667,12 @@ M.sync_callbacks = async (db, u, b) => {
   const dates = entries.map(e => Number(e.date)).filter(isFinite); let times = new Set();
   if (dates.length) times = new Set((await db.prepare(`SELECT start_ts FROM calls WHERE user_id=? AND start_ts BETWEEN ? AND ?`).bind(u.id, Math.min(...dates) - 3600000, Math.max(...dates) + 3600000).all()).results.map(r => r.start_ts));
   const m = R.matchCallbacks(entries, called, s, times); const now = Date.now(); const st = []; const phones = new Set();
+  // v1.3: a callback already recorded (same number, same start) is never recorded twice, so it can never pay twice
+  if (m.events.length) {
+    const lo = Math.min(...m.events.map(e => e.start_ts)), hi = Math.max(...m.events.map(e => e.start_ts)); const seenCb = new Set();
+    for (const r of (await db.prepare(`SELECT phone, start_ts FROM callbacks WHERE user_id=? AND start_ts BETWEEN ? AND ?`).bind(u.id, lo, hi).all()).results) seenCb.add(r.phone + '|' + r.start_ts);
+    m.events = m.events.filter(e => { const k = e.phone + '|' + e.start_ts; if (seenCb.has(k)) return false; seenCb.add(k); return true; });
+  }
   for (const e of m.events) { phones.add(e.phone); st.push(db.prepare(`INSERT OR IGNORE INTO callbacks (id, user_id, contact_id, phone, start_ts, duration, kind, synced_at, rate) VALUES (?,?,?,?,?,?,?,?,?)`).bind(uid(), u.id, called.get(e.phone).contact_id || null, e.phone, e.start_ts, e.duration, e.kind, now, s.call_rate)); }
   for (const r of m.returned) st.push(db.prepare(`UPDATE callbacks SET returned_at=? WHERE user_id=? AND phone=? AND kind='missed' AND start_ts < ? AND ? - start_ts <= 86400000 AND returned_at IS NULL`).bind(r.out_ts, u.id, r.phone, r.out_ts, r.out_ts));
   if (st.length) await chunked(st, 60, x => db.batch(x).then(() => []));
@@ -650,6 +684,44 @@ M.my_callbacks = async (db, u) => {
   const s = await getSettings(db); const a = R.retentionCutoff(Date.now(), s.retention_days);
   const rows = (await db.prepare(`SELECT b.id, b.phone, b.start_ts, b.duration, b.kind, b.returned_at, b.counted, k.name contact_name FROM callbacks b LEFT JOIN contacts k ON k.id=b.contact_id WHERE b.user_id=? AND b.start_ts >= ? ORDER BY b.start_ts DESC LIMIT 100`).bind(u.id, a).all()).results;
   return { callbacks: rows };
+};
+// ---- v1.3: one number's full history (every attempt and callback, in order, with what was paid) ----
+async function numberHistory(db, u, phone) {
+  const s = await getSettings(db); const adminView = u.role === 'admin';
+  const names = Object.fromEntries((await db.prepare(`SELECT id, name, username FROM users`).all()).results.map(x => [x.id, x.name || x.username]));
+  const cWhere = adminView ? '' : ' AND user_id=?', cArgs = adminView ? [phone] : [phone, u.id];
+  const calls = (await db.prepare(`SELECT id, user_id, tapped_at, start_ts, duration, log_found, outcome, note, counted, reason, lead_counted, lead_reason, call_pay, call_rate, lead_rate, approval_id FROM calls WHERE phone=?${cWhere}`).bind(...cArgs).all()).results;
+  const cbs = (await db.prepare(`SELECT id, user_id, start_ts, duration, kind, counted, reason, rate, returned_at FROM callbacks WHERE phone=?${cWhere}`).bind(...cArgs).all()).results;
+  const events = [];
+  for (const c of calls) {
+    const at = c.start_ts || c.tapped_at || 0; const connected = c.duration > 0; const callPaid = !!(c.counted && (c.call_pay == null || c.call_pay)); const leadPaid = !!c.lead_counted;
+    const result = !connected ? 'Not answered or cut' : c.outcome === 'interested' ? 'Interested' : (R.OUTCOME_LABEL[c.outcome] || 'Connected');
+    events.push({ at, kind: 'call', caller: names[c.user_id] || '', connected, duration: c.duration || 0, result, note: c.note || '', counted: !!c.counted,
+      reason: R.REASON_TEXT[c.reason] || c.reason || '', call_paid: callPaid, lead_paid: leadPaid, lead_note: c.outcome === 'interested' ? (c.lead_reason || '') : '',
+      amount: r2((callPaid ? Number(c.call_rate) || 0 : 0) + (leadPaid ? Number(c.lead_rate) || 0 : 0)) });
+  }
+  for (const b of cbs) {
+    const connected = b.kind === 'incoming' && b.duration > 0;
+    events.push({ at: b.start_ts, kind: 'callback', caller: names[b.user_id] || '', connected, duration: b.duration || 0,
+      result: b.kind === 'incoming' ? (connected ? 'Callback answered' : 'Callback not answered') : 'Missed callback (caller rang back, nobody answered)', note: '', counted: !!b.counted,
+      reason: R.REASON_TEXT[b.reason] || b.reason || '', call_paid: false, lead_paid: false, callback_paid: !!b.counted, amount: b.counted ? r2(Number(b.rate) || 0) : 0 });
+  }
+  events.sort((x, y) => x.at - y.at || (x.kind < y.kind ? -1 : 1));
+  const ct = await db.prepare(`SELECT name, area, status, lead_state, cb_count, assigned_to FROM contacts WHERE phone=?`).bind(phone).first();
+  let uploads = [];
+  if (adminView) uploads = (await db.prepare(`SELECT at, file_name, result, by FROM upload_hits WHERE phone=? ORDER BY at`).bind(phone).all()).results;
+  const sum = { attempts: events.filter(e => e.kind === 'call').length, connected: events.filter(e => e.kind === 'call' && e.connected).length, paid_calls: events.filter(e => e.call_paid).length, leads: events.filter(e => e.lead_paid).length, callbacks_paid: events.filter(e => e.callback_paid).length };
+  sum.amount = r2(events.reduce((a, e) => a + e.amount, 0));
+  const contact = ct ? { name: ct.name || '', area: ct.area || '', status: ct.status || '', lead_state: ct.lead_state || '', callbacks: ct.cb_count || 0, assigned_to: adminView ? (names[ct.assigned_to] || '') : undefined } : null;
+  return { phone, contact, uploads, events, summary: sum, rates: { call_rate: s.call_rate, lead_rate: s.lead_rate } };
+}
+M.number_history = async (db, u, b) => {
+  const phone = R.normPhone(b.phone); if (!phone) bad('Enter a 10-digit mobile number');
+  if (u.role === 'caller') {
+    const mine = await db.prepare(`SELECT 1 FROM contacts WHERE phone=? AND assigned_to=? UNION SELECT 1 FROM calls WHERE phone=? AND user_id=? LIMIT 1`).bind(phone, u.id, phone, u.id).first();
+    if (!mine) bad('This number is not on your list');
+  }
+  return numberHistory(db, u, phone);
 };
 // ---- log requests ----
 M.log_request_create = async (db, u, b) => {
