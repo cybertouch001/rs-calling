@@ -77,6 +77,7 @@ export function overlapIds(userCalls) {
 export function chainNumber(phoneCalls, s) {
   const xs = phoneCalls.slice().sort((a, b) => (a.start_ts || a.tapped_at || 0) - (b.start_ts || b.tapped_at || 0) || String(a.id).localeCompare(String(b.id)));
   const win = s.repeat_hours * 3600000; let lastCounted = -Infinity; let leadTaken = false; const res = new Map();
+  const since = Number(s.v13_since) || 0;   // calls starting at/after this moment follow the v1.3 rule: an Interested call pays only the lead
   for (const c of xs) {
     const t = c.start_ts || c.tapped_at || 0; let counted, reason;
     if (c.override === 0) { counted = false; reason = 'admin_no'; }
@@ -94,7 +95,10 @@ export function chainNumber(phoneCalls, s) {
       else if (leadTaken) lead_reason = 'Lead for this number already paid';
       else { lead_counted = true; leadTaken = true; lead_reason = 'Lead counted'; }
     }
-    res.set(c.id, { counted, reason, lead_counted, lead_reason });
+    // v1.3: an Interested call is paid by the lead only; the per-call rate is not added on top (no stacking)
+    const interestOnly = c.outcome === 'interested' && since > 0 && t >= since;
+    const call_pay = !!(counted && !interestOnly);
+    res.set(c.id, { counted, reason, lead_counted, lead_reason, call_pay });
   }
   return res;
 }
@@ -137,7 +141,7 @@ export function totals(calls, adjustments = [], callbacks = []) {
   for (const c of calls) {
     if (c.duration > 0) { t.connected++; t.talk_s += c.duration; }
     if (c.outcome === 'interested') t.interested++;
-    if (c.counted) { t.counted++; t.call_amount += Number(c.call_rate) || 0; }
+    if (c.counted) { t.counted++; if (c.call_pay == null || Number(c.call_pay)) t.call_amount += Number(c.call_rate) || 0; }
     if (c.lead_counted) { t.leads++; t.lead_amount += Number(c.lead_rate) || 0; }
   }
   for (const a of adjustments) t.adjust += Number(a.amount) || 0;
@@ -185,6 +189,8 @@ export const DEFAULTS11 = {
   withdraw_hours: 16,       // admin pays within this many hours of the request
   log_access_hours: 48,     // an approved log request stays viewable this long
   streak_bonus_since: 0,    // yyyymmdd the bonus was switched on (internal: no back-dated bonuses)
+  v13_since: 0,             // ms: v1.3 rules (Interested pays the lead only) apply to calls starting at or after this moment
+  callback_since: 0,        // ms: callbacks at or after this moment can pay (earlier callbacks are never back-paid)
 };
 Object.assign(DEFAULTS, DEFAULTS11);
 
@@ -275,6 +281,7 @@ export function callbackCounting(events, s) {
     for (const e of list) {
       let counted = false, reason;
       if (!s.callback_counts) reason = 'Callbacks are recorded but not paid';
+      else if (s.callback_since && e.start_ts < s.callback_since) reason = 'Callback came before callback payouts started';
       else if (e.kind !== 'incoming' || !(e.duration > 0)) reason = 'Missed callback';
       else if (e.duration < s.min_duration) reason = 'Callback shorter than the minimum duration';
       else if (e.start_ts - last < s.repeat_hours * 3600000) reason = 'Another counted callback from this number inside the repeat window';
